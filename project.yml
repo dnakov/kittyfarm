@@ -1,0 +1,73 @@
+name: KittyFarm
+options:
+  createIntermediateGroups: true
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.sigkitten.kittyfarm
+    SWIFT_VERSION: 6.0
+    MACOSX_DEPLOYMENT_TARGET: 26.0
+    GENERATE_INFOPLIST_FILE: YES
+    INFOPLIST_KEY_CFBundleDisplayName: KittyFarm
+    INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+    INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 sigkitten"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: 1
+    CODE_SIGNING_ALLOWED: YES
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Automatic
+packages:
+  swift-protobuf:
+    url: https://github.com/apple/swift-protobuf.git
+    from: 1.36.1
+  grpc-swift-2:
+    url: https://github.com/grpc/grpc-swift-2.git
+    from: 2.3.0
+  grpc-swift-nio-transport:
+    url: https://github.com/grpc/grpc-swift-nio-transport.git
+    from: 2.3.0
+  grpc-swift-protobuf:
+    url: https://github.com/grpc/grpc-swift-protobuf.git
+    from: 2.1.0
+targets:
+  KittyFarm:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: KittyFarm
+      - path: Protos
+        excludes:
+          - "*.proto"
+    resources:
+      - path: KittyFarm/Resources
+    dependencies:
+      - package: swift-protobuf
+        product: SwiftProtobuf
+      - package: grpc-swift-2
+        product: GRPCCore
+      - package: grpc-swift-nio-transport
+        product: GRPCNIOTransportHTTP2
+      - package: grpc-swift-protobuf
+        product: GRPCProtobuf
+    settings:
+      base:
+        PRODUCT_NAME: KittyFarm
+        ENABLE_HARDENED_RUNTIME: NO
+        SWIFT_OBJC_BRIDGING_HEADER: KittyFarm/Support/KittyFarm-Bridging-Header.h
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        OTHER_LDFLAGS:
+          - -ObjC
+    postCompileScripts:
+      - name: Validate Android gRPC assets
+        script: |
+          if [ ! -f "${SRCROOT}/Protos/emulator_controller.proto" ]; then
+            echo "warning: Protos/emulator_controller.proto is missing. Android emulator control bindings may drift from upstream."
+          fi
+
+          if [ ! -f "${SRCROOT}/Protos/emulator_controller_kittyfarm.proto" ]; then
+            echo "warning: Protos/emulator_controller_kittyfarm.proto is missing. Android gRPC client generation cannot be refreshed."
+          fi
+
+          if [ ! -f "${SRCROOT}/KittyFarm/Generated/emulator_controller_kittyfarm.pb.swift" ] || [ ! -f "${SRCROOT}/KittyFarm/Generated/emulator_controller_kittyfarm.grpc.swift" ]; then
+            echo "warning: Android gRPC stubs are missing. Regenerate them with GeneratedNotice.androidCodegenCommand."
+          fi
