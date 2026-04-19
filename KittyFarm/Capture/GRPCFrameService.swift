@@ -284,7 +284,11 @@ final class GRPCFrameService {
             options.maxRequestMessageBytes = Self.screenshotMaxResponseBytes
             options.maxResponseMessageBytes = Self.screenshotMaxResponseBytes
 
-            try await emulator.streamScreenshot(format, options: options) { response in
+            try await emulator.streamScreenshot(
+                format,
+                metadata: AndroidEmulatorAuth.metadata(forGRPCPort: grpcPort),
+                options: options
+            ) { response in
                 for try await image in response.messages {
                     let frame = try Self.makeFrame(from: image, sharedTransport: sharedTransport)
                     startupSignal.resume()

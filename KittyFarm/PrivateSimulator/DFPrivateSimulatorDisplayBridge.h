@@ -4,6 +4,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @class DFPrivateSimulatorDisplayBridge;
+@class DFPrivateSimulatorChromeButton;
 
 typedef NS_ENUM(NSInteger, DFPrivateSimulatorTouchPhase) {
     DFPrivateSimulatorTouchPhaseBegan = 0,
@@ -51,11 +52,29 @@ NS_SWIFT_NAME(PrivateSimulatorDisplayBridge)
 - (BOOL)sendKeyEvent:(NSEvent *)event
                error:(NSError * _Nullable * _Nullable)error NS_SWIFT_NAME(sendKey(event:));
 
+- (NSArray<DFPrivateSimulatorChromeButton *> *)availableChromeButtons NS_SWIFT_NAME(availableChromeButtons());
+- (BOOL)pressChromeButtonWithIdentifier:(NSString *)identifier
+                                  error:(NSError * _Nullable * _Nullable)error NS_SWIFT_NAME(pressChromeButton(identifier:));
+
 - (BOOL)pressHomeButton:(NSError * _Nullable * _Nullable)error NS_SWIFT_NAME(pressHomeButton());
 
 - (BOOL)rotateRight:(NSError * _Nullable * _Nullable)error NS_SWIFT_NAME(rotateRight());
 
 - (void)disconnect;
+
+@end
+
+NS_SWIFT_NAME(PrivateSimulatorChromeButton)
+@interface DFPrivateSimulatorChromeButton : NSObject
+
+- (instancetype)init NS_UNAVAILABLE;
+- (instancetype)new NS_UNAVAILABLE;
+
+@property (nonatomic, copy, readonly) NSString *identifier;
+@property (nonatomic, copy, readonly) NSString *title;
+@property (nonatomic, copy, readonly) NSString *toolTip;
+@property (nonatomic, copy, readonly) NSString *accessibilityLabel;
+@property (nonatomic, copy, readonly) NSString *summary;
 
 @end
 

@@ -1,0 +1,31 @@
+name: KittyProbe
+options:
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    IPHONEOS_DEPLOYMENT_TARGET: 17.0
+    CODE_SIGNING_ALLOWED: NO
+targets:
+  KittyProbeApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: KittyProbeApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sigkitten.kittyprobe
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+  KittyProbeTests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: KittyProbeTests
+    dependencies:
+      - target: KittyProbeApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sigkitten.kittyprobe.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: ""

@@ -13,6 +13,7 @@ final class IOSSimulatorConnection: NSObject, DeviceConnection, @preconcurrency 
     private var connectContinuation: CheckedContinuation<Void, Error>?
     private var connectTimeoutTask: Task<Void, Never>?
     private var didRunSelfTestTap = false
+    private var lastLoggedControlSignature: [String]?
 
     init(descriptor: DeviceDescriptor, state: DeviceState) throws {
         self.descriptor = descriptor
@@ -28,6 +29,7 @@ final class IOSSimulatorConnection: NSObject, DeviceConnection, @preconcurrency 
         state.simulatorDisplayBridge = displayBridge
         state.privateDisplayReady = displayBridge.isDisplayReady
         state.privateDisplayStatus = displayBridge.displayStatus
+        refreshAvailableSimulatorControls()
         syncLatestFrameFromBridge()
         runSelfTestTapIfNeeded()
     }
@@ -89,12 +91,65 @@ final class IOSSimulatorConnection: NSObject, DeviceConnection, @preconcurrency 
         try await simctlManager.setPasteboard(text, for: descriptor)
     }
 
+    func triggerSimulatorControl(_ identifier: String) async throws {
+        try displayBridge.pressChromeButton(identifier: identifier)
+        refreshAvailableSimulatorControls()
+    }
+
     func pressHomeButton() async throws {
         try displayBridge.pressHomeButton()
+        refreshAvailableSimulatorControls()
     }
 
     func rotateRight() async throws {
         try displayBridge.rotateRight()
+    }
+
+    func openApp(_ nameOrBundleID: String) async throws {
+        guard case let .iOSSimulator(udid, _, _) = descriptor else { return }
+
+        let bundleID = nameOrBundleID.contains(".")
+            ? nameOrBundleID
+            : try await Self.resolveIOSBundleID(name: nameOrBundleID, udid: udid)
+
+        let result = try await ProcessRunner.run(
+            XcrunUtils.simctl(["launch", udid, bundleID])
+        )
+        try result.requireSuccess("simctl launch \(bundleID)")
+    }
+
+    private static func resolveIOSBundleID(name: String, udid: String) async throws -> String {
+        let result = try await ProcessRunner.run(
+            XcrunUtils.simctl(["listapps", udid])
+        )
+        try result.requireSuccess("simctl listapps")
+
+        guard let data = result.stdout.data(using: .utf8),
+              let parsed = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let apps = parsed as? [String: [String: Any]] else {
+            throw IOSLaunchError.couldNotParseAppList
+        }
+
+        let needle = name.lowercased()
+
+        // Exact match on display/bundle name, then substring match.
+        var substringMatch: String?
+        for (bundleID, info) in apps {
+            let display = (info["CFBundleDisplayName"] as? String) ?? ""
+            let bundleName = (info["CFBundleName"] as? String) ?? ""
+            if display.lowercased() == needle || bundleName.lowercased() == needle {
+                return bundleID
+            }
+            if substringMatch == nil,
+               display.lowercased().contains(needle) || bundleName.lowercased().contains(needle) {
+                substringMatch = bundleID
+            }
+        }
+
+        if let substringMatch {
+            return substringMatch
+        }
+        throw IOSLaunchError.appNotFound(name)
     }
 
     func privateSimulatorDisplayBridge(_ bridge: PrivateSimulatorDisplayBridge, didUpdateFrame pixelBuffer: CVPixelBuffer) {
@@ -111,6 +166,7 @@ final class IOSSimulatorConnection: NSObject, DeviceConnection, @preconcurrency 
     func privateSimulatorDisplayBridge(_ bridge: PrivateSimulatorDisplayBridge, didChangeDisplayStatus status: String, isReady: Bool) {
         state.privateDisplayReady = isReady
         state.privateDisplayStatus = status
+        refreshAvailableSimulatorControls()
 
         if isReady {
             syncLatestFrameFromBridge()
@@ -147,6 +203,26 @@ final class IOSSimulatorConnection: NSObject, DeviceConnection, @preconcurrency 
 
         state.noteFrame(.pixelBuffer(ownedPixelBuffer))
         state.privateDisplayReady = true
+    }
+
+    private func refreshAvailableSimulatorControls() {
+        let controls = displayBridge
+            .availableChromeButtons()
+            .map(SimulatorChromeControl.init(button:))
+            .sorted {
+                if $0.sortPriority == $1.sortPriority {
+                    return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+                }
+                return $0.sortPriority < $1.sortPriority
+            }
+
+        state.availableSimulatorControls = controls
+
+        let signature = controls.map(\.helpText)
+        if signature != lastLoggedControlSignature {
+            lastLoggedControlSignature = signature
+            print("[KittyFarm][IOSSim] Available private simulator controls for \(descriptor.displayName): \(signature)")
+        }
     }
 
     private func runSelfTestTapIfNeeded() {
@@ -194,6 +270,18 @@ enum IOSSimulatorConnectionError: LocalizedError {
             return "The private iOS simulator connection was created for a non-iOS device descriptor."
         case let .privateDisplayUnavailable(status):
             return "Private SimulatorKit attach failed: \(status)"
+        }
+    }
+}
+
+enum IOSLaunchError: LocalizedError {
+    case couldNotParseAppList
+    case appNotFound(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .couldNotParseAppList: return "Could not parse simctl listapps output."
+        case .appNotFound(let name): return "No installed iOS app matching \"\(name)\"."
         }
     }
 }

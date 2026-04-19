@@ -15,6 +15,7 @@ struct DevicePaneView: View {
                 .padding(.vertical, 3)
                 .frame(maxWidth: .infinity)
                 .opacity(isHovering ? 1 : 0)
+                .animation(.smooth(duration: 0.25), value: isHovering)
 
             displayArea
                 .padding(.horizontal, 2)
@@ -24,6 +25,7 @@ struct DevicePaneView: View {
                 .padding(.vertical, 2)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .opacity(isHovering ? 1 : 0)
+                .animation(.smooth(duration: 0.25), value: isHovering)
         }
         .padding(8)
         .glassEffect(
@@ -31,6 +33,7 @@ struct DevicePaneView: View {
             in: .rect(cornerRadius: 12, style: .continuous)
         )
         .opacity(draggedDeviceID == state.id ? 0.35 : 1.0)
+        .animation(.smooth(duration: 0.2), value: draggedDeviceID == state.id)
         .contentShape(Rectangle())
         .onContinuousHover { phase in
             switch phase {
@@ -80,27 +83,39 @@ struct DevicePaneView: View {
 
             connectionBadge
 
-            if state.descriptor.platform == .iOSSimulator {
-                Button {
-                    Task { await store.pressHomeButton(on: state) }
-                } label: {
-                    Image(systemName: "house.fill")
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
-                .disabled(!state.isConnected)
-                .help("Press Home")
-
-                Button {
-                    Task { await store.rotateDeviceRight(on: state) }
-                } label: {
-                    Image(systemName: "rotate.right.fill")
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
-                .disabled(!state.isConnected)
-                .help("Rotate Right")
+            Button {
+                Task { await store.pressHomeButton(on: state) }
+            } label: {
+                Image(systemName: "house.fill")
             }
+            .buttonStyle(.glass)
+            .controlSize(.small)
+            .disabled(!state.isConnected)
+            .help("Press Home")
+
+            if state.descriptor.platform == .iOSSimulator {
+                ForEach(state.availableSimulatorControls.filter { !$0.isHomeLike }) { control in
+                    Button {
+                        Task { await store.triggerSimulatorControl(control, on: state) }
+                    } label: {
+                        Image(systemName: control.systemImage)
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+                    .disabled(!state.isConnected)
+                    .help(control.helpText)
+                }
+            }
+
+            Button {
+                Task { await store.rotateDeviceRight(on: state) }
+            } label: {
+                Image(systemName: "rotate.right.fill")
+            }
+            .buttonStyle(.glass)
+            .controlSize(.small)
+            .disabled(!state.isConnected)
+            .help("Rotate Right")
 
             Button {
                 Task { await store.buildAndPlay(for: state) }
@@ -178,6 +193,13 @@ struct DevicePaneView: View {
             )
 
             ZStack {
+                if let bridge = state.simulatorDisplayBridge {
+                    SimulatorDisplayView(bridge: bridge)
+                        .frame(width: fittedSize.width, height: fittedSize.height)
+                        .allowsHitTesting(false)
+                        .opacity(0.001)
+                }
+
                 MetalFrameView(state: state)
                     .frame(width: fittedSize.width, height: fittedSize.height)
 
@@ -259,9 +281,10 @@ struct DevicePaneView: View {
                     .font(.caption2)
                     .foregroundStyle(.red)
                     .lineLimit(2)
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .animation(.smooth(duration: 0.25), value: state.lastError)
     }
 
     private var platformIcon: String {

@@ -2,11 +2,22 @@
 
 #import <CoreVideo/CoreVideo.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
 #import <mach/mach_time.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <math.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
+
+// PurpleWorkspacePort mach message IDs / GSEvent type constants.
+// Reverse-engineered from Simulator.app ARM64 (Xcode 26.2) — see idb's
+// PrivateHeaders/SimulatorApp/GSEvent.h for the complete wire format.
+#define DFGSEventMachMessageID 0x7B
+#define DFGSEventHostFlag 0x20000
+#define DFGSEventTypeDeviceOrientationChanged 50
 
 static NSString * const DFPrivateSimulatorErrorDomain = @"KittyFarm.PrivateSimulator";
 static NSString * const DFSimulatorKitPath = @"/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit";
@@ -23,6 +34,7 @@ typedef IndigoHIDMessage *(*DFIndigoHIDMessageForMouseNSEventFn)(CGPoint *locati
 typedef IndigoHIDMessage *(*DFIndigoHIDMessageForKeyboardArbitraryFn)(int keyCode, int op);
 typedef IndigoHIDMessage *(*DFIndigoHIDMessageForKeyboardNSEventFn)(NSEvent *event);
 typedef IndigoHIDMessage *(*DFIndigoHIDMessageForButtonFn)(uint32_t buttonCode, uint32_t operation, uint32_t target);
+typedef IndigoHIDMessage *(*DFIndigoHIDMessageForHIDArbitraryFn)(uint32_t target, uint32_t page, uint32_t usage, uint32_t operation);
 typedef void (*DFSimDigitizerTouchMethodFn)(id inputView, const void *touchEvent);
 
 typedef struct {
@@ -93,6 +105,8 @@ static const int DFKeyboardDirectionDown = 1;
 static const int DFKeyboardDirectionUp = 2;
 static const uint32_t DFButtonDirectionDown = 1;
 static const uint32_t DFButtonDirectionUp = 2;
+static const uint32_t DFConsumerControlUsagePage = 0x0c;
+static const uint32_t DFHomeConsumerUsage = 0x65;
 // Apple Simulator sends Indigo button code 0x191 for Home; 1 is Lock.
 static const uint32_t DFHomeButtonCode = 0x191;
 static const NSUInteger DFKeyboardModifierShift = 1 << 0;
@@ -148,6 +162,259 @@ static void DFLog(NSString *format, ...) {
     [handle closeFile];
 }
 
+#pragma mark - SimulatorKit Swift symbol resolver
+//
+// We call into SimulatorKit's private Swift API by dlsym'ing mangled symbol
+// names. The leading bytes of a Swift mangling encode `module + class + member
+// name` and are stable across Xcode releases; the trailing bytes encode the
+// type signature, which Apple periodically reshapes (e.g. Xcode 26.4 retyped
+// `SimDeviceScreenAdapter.screens` from `[UInt32: SimScreen]` (ObjC) to
+// `[UInt32: SimDeviceScreen]` (Swift), invalidating the old mangled tail).
+//
+// Instead of hardcoding the full mangled name, we walk SimulatorKit's
+// `LC_SYMTAB` once and find the first symbol whose name matches a stable
+// (prefix, suffix) pair — typically `…member_name` + `vg`/`vs`/`F`. Resolved
+// pointers are cached per (prefix, suffix). When a lookup fails we log loudly
+// so the next breaking change shows up as a clear "missing: X" instead of a
+// silent timeout downstream.
+
+static const struct mach_header_64 *gSimulatorKitImage = NULL;
+static intptr_t gSimulatorKitSlide = 0;
+
+static void DFLocateSimulatorKitImageOnce(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class probe = NSClassFromString(@"SimulatorKit.SimDeviceScreenAdapter");
+        if (probe == Nil) {
+            probe = NSClassFromString(@"SimulatorKit.SimDeviceScreen");
+        }
+        if (probe == Nil) {
+            DFLog(@"warning: SimulatorKit not yet loaded — cannot locate Mach-O image for symbol resolution");
+            return;
+        }
+        Dl_info info = {0};
+        if (dladdr((__bridge const void *)probe, &info) == 0 || info.dli_fbase == NULL) {
+            DFLog(@"warning: dladdr failed on SimulatorKit class — symbol prefix lookups disabled");
+            return;
+        }
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count; i++) {
+            const struct mach_header *header = _dyld_get_image_header(i);
+            if ((const void *)header != info.dli_fbase) {
+                continue;
+            }
+            if (header->magic != MH_MAGIC_64 && header->magic != MH_CIGAM_64) {
+                DFLog(@"warning: SimulatorKit Mach-O is not 64-bit (magic=0x%x)", header->magic);
+                return;
+            }
+            gSimulatorKitImage = (const struct mach_header_64 *)header;
+            gSimulatorKitSlide = _dyld_get_image_vmaddr_slide(i);
+            return;
+        }
+        DFLog(@"warning: SimulatorKit image not found in dyld image list");
+    });
+}
+
+// Read a uleb128-encoded integer, advancing *p.
+static uint64_t DFReadULEB(const uint8_t **p, const uint8_t *end) {
+    uint64_t result = 0;
+    int shift = 0;
+    while (*p < end) {
+        uint8_t byte = *(*p)++;
+        result |= ((uint64_t)(byte & 0x7f)) << shift;
+        if ((byte & 0x80) == 0) break;
+        shift += 7;
+        if (shift >= 64) break;
+    }
+    return result;
+}
+
+// DFS the dyld exports trie, returning the first terminal whose full mangled
+// name starts with `prefix` and ends with `suffix`. Trie pruning means we
+// visit only paths consistent with the prefix; effectively O(prefix length +
+// matching subtree size).
+typedef struct {
+    const uint8_t *trie;
+    const uint8_t *trieEnd;
+    const char *prefix;
+    size_t prefixLen;
+    const char *suffix;
+    size_t suffixLen;
+    uint64_t address;     // resolved symbol address (image-relative); 0 if none
+    BOOL found;
+    char nameBuf[1024];
+} DFTrieContext;
+
+static void DFTrieDescend(DFTrieContext *ctx, const uint8_t *node, size_t nameLen) {
+    if (ctx->found || node == NULL || node >= ctx->trieEnd) return;
+
+    const uint8_t *p = node;
+    uint64_t termSize = DFReadULEB(&p, ctx->trieEnd);
+
+    if (termSize > 0) {
+        // Path so far == terminal symbol's full name.
+        if (nameLen >= ctx->prefixLen + ctx->suffixLen &&
+            memcmp(ctx->nameBuf, ctx->prefix, ctx->prefixLen) == 0 &&
+            (ctx->suffixLen == 0 ||
+             memcmp(ctx->nameBuf + nameLen - ctx->suffixLen, ctx->suffix, ctx->suffixLen) == 0)) {
+            const uint8_t *info = p;
+            uint64_t flags = DFReadULEB(&info, ctx->trieEnd);
+            uint64_t address = DFReadULEB(&info, ctx->trieEnd);
+            // Skip re-exports (REEXPORT=0x08) and resolver stubs (STUB_AND_RESOLVER=0x10).
+            if ((flags & 0x08) == 0 && (flags & 0x10) == 0) {
+                ctx->address = address;
+                ctx->found = YES;
+                return;
+            }
+        }
+        p += termSize;
+    }
+
+    if (p >= ctx->trieEnd) return;
+    uint8_t childCount = *p++;
+
+    for (uint8_t i = 0; i < childCount; i++) {
+        if (p >= ctx->trieEnd) return;
+        const char *edgeLabel = (const char *)p;
+        size_t labelLen = strnlen(edgeLabel, (size_t)(ctx->trieEnd - p));
+        p += labelLen + 1;
+        if (p > ctx->trieEnd) return;
+        uint64_t childOffset = DFReadULEB(&p, ctx->trieEnd);
+
+        size_t newLen = nameLen + labelLen;
+        if (newLen >= sizeof(ctx->nameBuf)) continue;
+
+        // Prune: the appended label must keep us on a path consistent with prefix.
+        size_t cmpLen = newLen < ctx->prefixLen ? newLen : ctx->prefixLen;
+        size_t cmpStart = nameLen < ctx->prefixLen ? nameLen : ctx->prefixLen;
+        if (cmpLen > cmpStart) {
+            if (memcmp(edgeLabel, ctx->prefix + cmpStart, cmpLen - cmpStart) != 0) {
+                continue;
+            }
+        }
+
+        memcpy(ctx->nameBuf + nameLen, edgeLabel, labelLen);
+        DFTrieDescend(ctx, ctx->trie + childOffset, newLen);
+        if (ctx->found) return;
+    }
+}
+
+// Resolves a Swift symbol exported from SimulatorKit by stable mangled prefix
+// + suffix, walking the dyld exports trie (where Swift exports live in modern
+// Mach-O builds — LC_SYMTAB only carries local/debug symbols).
+static void *DFFindSwiftSymbol(const char *prefix, const char *suffix) {
+    DFLocateSimulatorKitImageOnce();
+    if (gSimulatorKitImage == NULL || prefix == NULL || prefix[0] == '\0') {
+        return NULL;
+    }
+
+    const struct linkedit_data_command *exportsTrie = NULL;
+    const struct segment_command_64 *linkedit = NULL;
+    uint64_t dyldInfoExportOff = 0;
+    uint64_t dyldInfoExportSize = 0;
+
+    const struct load_command *lc = (const struct load_command *)((const char *)gSimulatorKitImage + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < gSimulatorKitImage->ncmds; i++) {
+        switch (lc->cmd) {
+            case LC_DYLD_EXPORTS_TRIE:
+                exportsTrie = (const struct linkedit_data_command *)lc;
+                break;
+            case LC_DYLD_INFO:
+            case LC_DYLD_INFO_ONLY: {
+                const struct dyld_info_command *info = (const struct dyld_info_command *)lc;
+                dyldInfoExportOff = info->export_off;
+                dyldInfoExportSize = info->export_size;
+                break;
+            }
+            case LC_SEGMENT_64: {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+                    linkedit = seg;
+                }
+                break;
+            }
+        }
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+
+    if (linkedit == NULL) {
+        DFLog(@"warning: SimulatorKit Mach-O has no __LINKEDIT segment");
+        return NULL;
+    }
+
+    uint64_t trieFileOff = 0;
+    uint64_t trieSize = 0;
+    if (exportsTrie != NULL && exportsTrie->datasize > 0) {
+        trieFileOff = exportsTrie->dataoff;
+        trieSize = exportsTrie->datasize;
+    } else if (dyldInfoExportSize > 0) {
+        trieFileOff = dyldInfoExportOff;
+        trieSize = dyldInfoExportSize;
+    } else {
+        DFLog(@"warning: SimulatorKit has no LC_DYLD_EXPORTS_TRIE / LC_DYLD_INFO export trie");
+        return NULL;
+    }
+
+    uintptr_t linkeditMapped = (uintptr_t)linkedit->vmaddr + (uintptr_t)gSimulatorKitSlide - (uintptr_t)linkedit->fileoff;
+    const uint8_t *trie = (const uint8_t *)(linkeditMapped + (uintptr_t)trieFileOff);
+
+    // The exports trie stores symbol names with the leading `_` that dlsym
+    // strips by convention. Prepend it to the search prefix so the trie's
+    // edge labels (which start with `_`) match our prefix from the root.
+    char prefixedBuf[1024];
+    int written = snprintf(prefixedBuf, sizeof(prefixedBuf), "_%s", prefix);
+    if (written < 0 || (size_t)written >= sizeof(prefixedBuf)) {
+        return NULL;
+    }
+
+    DFTrieContext ctx = {0};
+    ctx.trie = trie;
+    ctx.trieEnd = trie + trieSize;
+    ctx.prefix = prefixedBuf;
+    ctx.prefixLen = (size_t)written;
+    ctx.suffix = suffix ?: "";
+    ctx.suffixLen = suffix ? strlen(suffix) : 0;
+
+    DFTrieDescend(&ctx, trie, 0);
+
+    if (!ctx.found) {
+        return NULL;
+    }
+    return (void *)((uintptr_t)gSimulatorKitImage + (uintptr_t)ctx.address);
+}
+
+// Cache resolved function pointers per (prefix, suffix). Logs once per missing
+// symbol so the first run after a breaking Xcode update names exactly what
+// went away.
+static void *DFResolveSwiftSymbol(const char *prefix, const char *suffix, const char *role) {
+    static NSLock *lock;
+    static NSMutableDictionary<NSString *, NSValue *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        lock = [NSLock new];
+        cache = [NSMutableDictionary new];
+    });
+
+    NSString *key = [NSString stringWithFormat:@"%s\x01%s", prefix ?: "", suffix ?: ""];
+    [lock lock];
+    NSValue *cached = cache[key];
+    [lock unlock];
+    if (cached != nil) {
+        return [cached pointerValue];
+    }
+
+    void *fn = DFFindSwiftSymbol(prefix, suffix);
+    if (fn == NULL) {
+        DFLog(@"warning: SimulatorKit symbol missing — role='%s' prefix='%s' suffix='%s'. Likely renamed in this Xcode; private bridge will skip this hook.",
+              role ?: "?", prefix ?: "", suffix ?: "");
+    }
+
+    [lock lock];
+    cache[key] = [NSValue valueWithPointer:fn];
+    [lock unlock];
+    return fn;
+}
+
 static id DFDigitizerDelegateGetter(id self, SEL _cmd) {
     return objc_getAssociatedObject(self, DFDigitizerDelegateAssociationKey);
 }
@@ -182,18 +449,48 @@ static id DFSendObject(id target, const char *selectorName) {
     return ((id(*)(id, SEL))objc_msgSend)(target, sel_registerName(selectorName));
 }
 
+static NSString *DFOptionalStringFromObjectSelector(id target, const char *selectorName) {
+    if (target == nil || selectorName == NULL) {
+        return nil;
+    }
+
+    id value = DFSendObject(target, selectorName);
+    return [value isKindOfClass:[NSString class]] ? value : nil;
+}
+
+static NSString *DFTrimmedString(NSString *value) {
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmed.length > 0 ? trimmed : nil;
+}
+
 static id DFAllocInitRect(Class cls, NSRect rect) {
     id instance = ((id(*)(id, SEL))objc_msgSend)(cls, sel_registerName("alloc"));
     return ((id(*)(id, SEL, NSRect))objc_msgSend)(instance, sel_registerName("initWithFrame:"), rect);
 }
 
-static id DFCallSwiftSelfGetter(id selfObject, const char *symbolName) {
-    if (selfObject == nil) {
-        return nil;
+// Logs missing dlsym lookups exactly once per (symbol) so we can spot Apple's
+// renames without spamming.
+static void DFLogMissingSymbolOnce(const char *symbolName) {
+    if (symbolName == NULL || symbolName[0] == '\0') return;
+    static NSLock *lock;
+    static NSMutableSet<NSString *> *seen;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        lock = [NSLock new];
+        seen = [NSMutableSet new];
+    });
+    NSString *key = [NSString stringWithUTF8String:symbolName];
+    [lock lock];
+    BOOL isNew = ![seen containsObject:key];
+    if (isNew) [seen addObject:key];
+    [lock unlock];
+    if (isNew) {
+        DFLog(@"warning: dlsym('%s') returned NULL — symbol likely renamed in this Xcode/macOS.", symbolName);
     }
+}
 
-    void *function = dlsym(RTLD_DEFAULT, symbolName);
-    if (function == NULL) {
+static id DFCallSwiftSelfGetterByFunction(id selfObject, void *function) {
+    if (selfObject == nil || function == NULL) {
         return nil;
     }
 
@@ -209,9 +506,55 @@ static id DFCallSwiftSelfGetter(id selfObject, const char *symbolName) {
     return result;
 }
 
+static id DFCallSwiftSelfGetter(id selfObject, const char *symbolName) {
+    if (selfObject == nil) return nil;
+    void *function = dlsym(RTLD_DEFAULT, symbolName);
+    if (function == NULL) {
+        DFLogMissingSymbolOnce(symbolName);
+        return nil;
+    }
+    return DFCallSwiftSelfGetterByFunction(selfObject, function);
+}
+
+static id DFCallSwiftSelfGetterByPattern(id selfObject, const char *prefix, const char *suffix, const char *role) {
+    if (selfObject == nil) return nil;
+    void *function = DFResolveSwiftSymbol(prefix, suffix, role);
+    return DFCallSwiftSelfGetterByFunction(selfObject, function);
+}
+
 static NSDictionary<NSNumber *, id> * DFReadAdapterScreens(id adapter) {
-    id screens = DFCallSwiftSelfGetter(adapter, "$s12SimulatorKit22SimDeviceScreenAdapterC7screensSDys6UInt32VSo0cE0_pGvg");
-    return [screens isKindOfClass:[NSDictionary class]] ? screens : @{};
+    // The full mangled tail of `SimDeviceScreenAdapter.screens.getter` drifts
+    // across Xcode releases (Xcode 26.4 retyped it from
+    // `[UInt32: SimScreen]` (ObjC) to `[UInt32: SimDeviceScreen]` (Swift)).
+    // Resolve by stable prefix instead. If the values are now SimDeviceScreen
+    // wrappers, unwrap each via `.screen` so callers keep talking to a
+    // SimScreen-shaped object.
+    id screens = DFCallSwiftSelfGetterByPattern(
+        adapter,
+        "$s12SimulatorKit22SimDeviceScreenAdapterC7screens",
+        "vg",
+        "SimDeviceScreenAdapter.screens.getter"
+    );
+    if (![screens isKindOfClass:[NSDictionary class]]) {
+        return @{};
+    }
+
+    NSMutableDictionary<NSNumber *, id> *unwrapped = [NSMutableDictionary dictionaryWithCapacity:[(NSDictionary *)screens count]];
+    SEL screenSelector = sel_registerName("screen");
+    [(NSDictionary *)screens enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+        if (![key isKindOfClass:[NSNumber class]] || value == nil) {
+            return;
+        }
+        id rawScreen = value;
+        if ([value respondsToSelector:screenSelector]) {
+            id underlying = ((id(*)(id, SEL))objc_msgSend)(value, screenSelector);
+            if (underlying != nil) {
+                rawScreen = underlying;
+            }
+        }
+        unwrapped[key] = rawScreen;
+    }];
+    return unwrapped;
 }
 
 static uint32_t DFCallSwiftSelfGetterU32(id selfObject, const char *symbolName) {
@@ -232,6 +575,27 @@ static uint32_t DFCallSwiftSelfGetterU32(id selfObject, const char *symbolName) 
         : "=r" (result)
         : "r" (selfObject), "r" (function)
         : "x0", "x20", "x30", "memory"
+    );
+    return result;
+}
+
+static uintptr_t DFCallSwiftUWordGetter(const char *symbolName) {
+    if (symbolName == NULL) {
+        return 0;
+    }
+
+    void *function = dlsym(RTLD_DEFAULT, symbolName);
+    if (function == NULL) {
+        return 0;
+    }
+
+    uintptr_t result = 0;
+    __asm__ volatile(
+        "blr %1\n"
+        "mov %0, x0\n"
+        : "=r" (result)
+        : "r" (function)
+        : "x0", "x30", "memory"
     );
     return result;
 }
@@ -258,13 +622,8 @@ static BOOL DFCallSwiftVoidMethodWithSelfAndTwoArgs(id selfObject, id firstArgum
     return YES;
 }
 
-static BOOL DFCallSwiftVoidMethodWithSelfAndObject(id selfObject, id firstArgument, const char *symbolName) {
-    if (selfObject == nil || firstArgument == nil) {
-        return NO;
-    }
-
-    void *function = dlsym(RTLD_DEFAULT, symbolName);
-    if (function == NULL) {
+static BOOL DFCallSwiftVoidMethodWithSelfAndObjectByFunction(id selfObject, id firstArgument, void *function) {
+    if (selfObject == nil || firstArgument == nil || function == NULL) {
         return NO;
     }
 
@@ -277,6 +636,22 @@ static BOOL DFCallSwiftVoidMethodWithSelfAndObject(id selfObject, id firstArgume
         : "x0", "x20", "x30", "memory"
     );
     return YES;
+}
+
+static BOOL DFCallSwiftVoidMethodWithSelfAndObject(id selfObject, id firstArgument, const char *symbolName) {
+    if (selfObject == nil || firstArgument == nil) return NO;
+    void *function = dlsym(RTLD_DEFAULT, symbolName);
+    if (function == NULL) {
+        DFLogMissingSymbolOnce(symbolName);
+        return NO;
+    }
+    return DFCallSwiftVoidMethodWithSelfAndObjectByFunction(selfObject, firstArgument, function);
+}
+
+static BOOL DFCallSwiftVoidMethodWithSelfAndObjectByPattern(id selfObject, id firstArgument, const char *prefix, const char *suffix, const char *role) {
+    if (selfObject == nil || firstArgument == nil) return NO;
+    void *function = DFResolveSwiftSymbol(prefix, suffix, role);
+    return DFCallSwiftVoidMethodWithSelfAndObjectByFunction(selfObject, firstArgument, function);
 }
 
 static BOOL DFCallSwiftVoidMethodWithSelfAndUWordAndBool(id selfObject, uintptr_t firstArgument, BOOL secondArgument, const char *symbolName) {
@@ -400,6 +775,11 @@ static Ivar DFGetIvar(id object, const char *name) {
         return NULL;
     }
     return class_getInstanceVariable([object class], name);
+}
+
+static id DFGetObjectIvar(id object, const char *name) {
+    Ivar ivar = DFGetIvar(object, name);
+    return ivar != NULL ? object_getIvar(object, ivar) : nil;
 }
 
 static void DFSetBoolIvar(id object, const char *name, BOOL value) {
@@ -634,13 +1014,31 @@ static IndigoHIDMessage *DFCreateButtonMessage(uint32_t buttonCode, uint32_t ope
     return message;
 }
 
-static BOOL DFCallSwiftUnitAngleMeasurementGetter(id selfObject, const char *symbolName, DFUnitAngleMeasurement *measurement) {
-    if (selfObject == nil || measurement == NULL) {
-        return NO;
+static IndigoHIDMessage *DFCreateArbitraryHIDMessage(uint32_t target, uint32_t page, uint32_t usage, uint32_t operation, NSError **error) {
+    DFIndigoHIDMessageForHIDArbitraryFn arbitraryMessage = (DFIndigoHIDMessageForHIDArbitraryFn)dlsym(RTLD_DEFAULT, "IndigoHIDMessageForHIDArbitrary");
+    if (arbitraryMessage == NULL) {
+        if (error != NULL) {
+            *error = DFMakeError(
+                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+                @"SimulatorKit did not expose IndigoHIDMessageForHIDArbitrary."
+            );
+        }
+        return NULL;
     }
 
-    void *function = dlsym(RTLD_DEFAULT, symbolName);
-    if (function == NULL) {
+    IndigoHIDMessage *message = arbitraryMessage(target, page, usage, operation);
+    if (message == NULL && error != NULL) {
+        *error = DFMakeError(
+            DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+            [NSString stringWithFormat:@"SimulatorKit could not construct arbitrary HID for page 0x%x usage 0x%x.", page, usage]
+        );
+    }
+
+    return message;
+}
+
+static BOOL DFCallSwiftUnitAngleMeasurementGetterByFunction(id selfObject, void *function, DFUnitAngleMeasurement *measurement) {
+    if (selfObject == nil || function == NULL || measurement == NULL) {
         return NO;
     }
 
@@ -658,13 +1056,24 @@ static BOOL DFCallSwiftUnitAngleMeasurementGetter(id selfObject, const char *sym
     return YES;
 }
 
-static BOOL DFCallSwiftUnitAngleMeasurementSetter(id selfObject, DFUnitAngleMeasurement measurement, const char *symbolName) {
-    if (selfObject == nil) {
-        return NO;
-    }
-
+static BOOL DFCallSwiftUnitAngleMeasurementGetter(id selfObject, const char *symbolName, DFUnitAngleMeasurement *measurement) {
+    if (selfObject == nil || measurement == NULL) return NO;
     void *function = dlsym(RTLD_DEFAULT, symbolName);
     if (function == NULL) {
+        DFLogMissingSymbolOnce(symbolName);
+        return NO;
+    }
+    return DFCallSwiftUnitAngleMeasurementGetterByFunction(selfObject, function, measurement);
+}
+
+static BOOL DFCallSwiftUnitAngleMeasurementGetterByPattern(id selfObject, const char *prefix, const char *suffix, const char *role, DFUnitAngleMeasurement *measurement) {
+    if (selfObject == nil || measurement == NULL) return NO;
+    void *function = DFResolveSwiftSymbol(prefix, suffix, role);
+    return DFCallSwiftUnitAngleMeasurementGetterByFunction(selfObject, function, measurement);
+}
+
+static BOOL DFCallSwiftUnitAngleMeasurementSetterByFunction(id selfObject, DFUnitAngleMeasurement measurement, void *function) {
+    if (selfObject == nil || function == NULL) {
         return NO;
     }
 
@@ -679,6 +1088,22 @@ static BOOL DFCallSwiftUnitAngleMeasurementSetter(id selfObject, DFUnitAngleMeas
     );
 
     return YES;
+}
+
+static BOOL DFCallSwiftUnitAngleMeasurementSetter(id selfObject, DFUnitAngleMeasurement measurement, const char *symbolName) {
+    if (selfObject == nil) return NO;
+    void *function = dlsym(RTLD_DEFAULT, symbolName);
+    if (function == NULL) {
+        DFLogMissingSymbolOnce(symbolName);
+        return NO;
+    }
+    return DFCallSwiftUnitAngleMeasurementSetterByFunction(selfObject, measurement, function);
+}
+
+static BOOL DFCallSwiftUnitAngleMeasurementSetterByPattern(id selfObject, DFUnitAngleMeasurement measurement, const char *prefix, const char *suffix, const char *role) {
+    if (selfObject == nil) return NO;
+    void *function = DFResolveSwiftSymbol(prefix, suffix, role);
+    return DFCallSwiftUnitAngleMeasurementSetterByFunction(selfObject, measurement, function);
 }
 
 static double DFNormalizedDegrees(double value) {
@@ -761,33 +1186,144 @@ static BOOL DFSendIntegerSelectorIfAvailable(id target, const char *selectorName
     return YES;
 }
 
+// Port lookup on SimDevice — still exposed on macOS 26 even though sendPurpleEvent:
+// has been pruned. Returns 0 if unavailable. Matches idb's
+// `[simulator.device lookup:@"PurpleWorkspacePort" error:&err]` call.
+static mach_port_t DFLookupSimDeviceMachPort(id device, NSString *portName) {
+    if (device == nil || portName.length == 0) {
+        return MACH_PORT_NULL;
+    }
+
+    SEL selector = sel_registerName("lookup:error:");
+    if (![device respondsToSelector:selector]) {
+        return MACH_PORT_NULL;
+    }
+
+    NSError *lookupError = nil;
+    mach_port_t port = ((mach_port_t(*)(id, SEL, NSString *, NSError **))objc_msgSend)(
+        device, selector, portName, &lookupError);
+    if (port == MACH_PORT_NULL && lookupError != nil) {
+        DFLog(@"SimDevice lookup:%@ error: %@", portName, lookupError.localizedDescription);
+    }
+    return port;
+}
+
+// Send a GSEvent mach message over PurpleWorkspacePort. Reimplements fbsimctl's
+// FBSimulatorHID.sendPurpleEvent: / FBSimulatorPurpleHID.orientationEvent: in a
+// self-contained form because modern SimDevice no longer exposes sendPurpleEvent:.
+//
+// Wire format (see idb PrivateHeaders/SimulatorApp/GSEvent.h):
+//   0x00  msgh_bits          = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+//   0x04  msgh_size          = 108 (0x6C) — align4(4 + 0x6B)
+//   0x08  msgh_remote_port   = PurpleWorkspacePort
+//   0x0C  msgh_local_port    = MACH_PORT_NULL
+//   0x14  msgh_id            = 0x7B
+//   0x18  GSEvent type       = GSEventTypeDeviceOrientationChanged | GSEventHostFlag
+//   0x48  record_info_size   = 4
+//   0x4C  orientation value  = UIDeviceOrientation
 static BOOL DFSendPurpleOrientationEvent(id device, NSInteger orientationValue) {
-    if (device == nil) {
+    mach_port_t purplePort = DFLookupSimDeviceMachPort(device, @"PurpleWorkspacePort");
+    if (purplePort == MACH_PORT_NULL) {
+        DFLog(@"PurpleWorkspacePort unavailable — cannot send GSEvent orientation");
         return NO;
     }
 
-    SEL selector = sel_registerName("sendPurpleEvent:");
+    uint8_t buf[112];
+    memset(buf, 0, sizeof(buf));
+
+    mach_msg_header_t *header = (mach_msg_header_t *)buf;
+    header->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    header->msgh_size = 108;
+    header->msgh_remote_port = purplePort;
+    header->msgh_local_port = MACH_PORT_NULL;
+    header->msgh_id = DFGSEventMachMessageID;
+
+    *(uint32_t *)(buf + 0x18) = DFGSEventTypeDeviceOrientationChanged | DFGSEventHostFlag;
+    *(uint32_t *)(buf + 0x48) = 4;
+    *(uint32_t *)(buf + 0x4C) = (uint32_t)orientationValue;
+
+    kern_return_t kr = mach_msg_send(header);
+    if (kr != KERN_SUCCESS) {
+        DFLog(@"mach_msg_send to PurpleWorkspacePort failed: %d (%s)", kr, mach_error_string(kr));
+        return NO;
+    }
+
+    DFLog(@"Sent GSEvent orientation %ld via PurpleWorkspacePort", (long)orientationValue);
+    return YES;
+}
+
+// Post a Darwin notification inside the guest iOS via SimDevice. Same selector
+// idb uses in FBSimulatorHID.postDarwinNotification:error:. This is the fallback
+// channel we use to signal orientation changes because on iOS 26 the GSEvent
+// orientation pipe no longer drives UIKit autorotation — apps listen for
+// `com.sigkitten.kittyfarm.rotate.<name>` and force a geometry update.
+static BOOL DFPostSimDeviceDarwinNotification(id device, NSString *notificationName) {
+    if (device == nil || notificationName.length == 0) {
+        return NO;
+    }
+
+    SEL selector = sel_registerName("postDarwinNotification:error:");
     if (![device respondsToSelector:selector]) {
         return NO;
     }
 
-    uint8_t purpleEvent[0x50];
-    memset(purpleEvent, 0, sizeof(purpleEvent));
-    memset(purpleEvent, 0xFF, 16);
-
-    *(uint64_t *)(purpleEvent + 0x10) = 0x7b00000000ULL;
-    *(uint32_t *)(purpleEvent + 0x18) = 0x32;
-    *(uint32_t *)(purpleEvent + 0x48) = 4;
-    *(uint32_t *)(purpleEvent + 0x4C) = (uint32_t)orientationValue;
-
-    ((void(*)(id, SEL, const void *))objc_msgSend)(device, selector, purpleEvent);
-    DFLog(@"Sent simulator device orientation %ld via sendPurpleEvent:", (long)orientationValue);
+    NSError *postError = nil;
+    BOOL ok = ((BOOL(*)(id, SEL, NSString *, NSError **))objc_msgSend)(
+        device, selector, notificationName, &postError);
+    if (!ok) {
+        DFLog(@"postDarwinNotification:%@ failed: %@", notificationName, postError.localizedDescription ?: @"unknown");
+        return NO;
+    }
+    DFLog(@"Posted Darwin notification: %@", notificationName);
     return YES;
 }
 
+static NSString *DFRotationNotificationNameForOrientation(NSInteger orientationValue) {
+    // Matches UIDeviceOrientation enum.
+    switch (orientationValue) {
+    case 1: return @"com.sigkitten.kittyfarm.rotate.portrait";
+    case 2: return @"com.sigkitten.kittyfarm.rotate.portrait-upside-down";
+    case 3: return @"com.sigkitten.kittyfarm.rotate.landscape-left";
+    case 4: return @"com.sigkitten.kittyfarm.rotate.landscape-right";
+    default: return nil;
+    }
+}
+
+static BOOL DFTrySendIntegerSelectors(id target, NSString *label, NSInteger value) {
+    if (target == nil) {
+        return NO;
+    }
+
+    static const char *const candidateSelectors[] = {
+        "gsEventsSendOrientation:",
+        "setDeviceOrientation:",
+        "setOrientation:",
+        "_setDeviceOrientation:",
+        "_setOrientation:",
+        "setInterfaceOrientation:",
+        "_setInterfaceOrientation:",
+        "sendOrientation:",
+        "simulateOrientation:",
+        "setSimulatedDeviceOrientation:",
+        "applyOrientation:",
+        "requestOrientationChange:",
+        "setCurrentOrientation:",
+        "rotateToOrientation:",
+    };
+
+    size_t count = sizeof(candidateSelectors) / sizeof(candidateSelectors[0]);
+    for (size_t index = 0; index < count; index += 1) {
+        if (DFSendIntegerSelectorIfAvailable(target, candidateSelectors[index], value)) {
+            DFLog(@"Sent orientation %ld via %@ -%s", (long)value, label, candidateSelectors[index]);
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
 static BOOL DFSendDeviceOrientationEvent(id device, NSInteger orientationValue) {
-    if (DFSendIntegerSelectorIfAvailable(device, "gsEventsSendOrientation:", orientationValue)) {
-        DFLog(@"Sent simulator device orientation %ld via gsEventsSendOrientation:", (long)orientationValue);
+    if (DFTrySendIntegerSelectors(device, @"device", orientationValue)) {
         return YES;
     }
 
@@ -798,12 +1334,12 @@ static BOOL DFSendDeviceOrientationEvent(id device, NSInteger orientationValue) 
     return NO;
 }
 
-static BOOL DFSetDisplayRotationMeasurement(id object, DFUnitAngleMeasurement measurement, const char *setterSymbol) {
-    if (object == nil || setterSymbol == NULL) {
+static BOOL DFSetDisplayRotationMeasurement(id object, DFUnitAngleMeasurement measurement, const char *prefix, const char *role) {
+    if (object == nil || prefix == NULL) {
         return NO;
     }
 
-    return DFCallSwiftUnitAngleMeasurementSetter(object, measurement, setterSymbol);
+    return DFCallSwiftUnitAngleMeasurementSetterByPattern(object, measurement, prefix, "vsTj", role);
 }
 
 static void DFConfigureDisplayGeometry(id displayView, CGSize displaySize) {
@@ -816,14 +1352,14 @@ static void DFConfigureDisplayGeometry(id displayView, CGSize displaySize) {
         ((void(*)(id, SEL, NSRect))objc_msgSend)(displayView, @selector(setFrame:), frame);
     }
 
-    id chromeView = object_getIvar(displayView, DFGetIvar(displayView, "chromeView"));
+    id chromeView = DFGetObjectIvar(displayView, "chromeView");
     if (chromeView != nil) {
         if ([chromeView respondsToSelector:@selector(setFrame:)]) {
             ((void(*)(id, SEL, NSRect))objc_msgSend)(chromeView, @selector(setFrame:), frame);
         }
         DFSetCGSizeIvar(chromeView, "displaySize", displaySize);
 
-        id chromeRenderView = object_getIvar(chromeView, DFGetIvar(chromeView, "_renderView"));
+        id chromeRenderView = DFGetObjectIvar(chromeView, "_renderView");
         if (chromeRenderView != nil) {
             if ([chromeRenderView respondsToSelector:@selector(setFrame:)]) {
                 ((void(*)(id, SEL, NSRect))objc_msgSend)(chromeRenderView, @selector(setFrame:), frame);
@@ -831,6 +1367,391 @@ static void DFConfigureDisplayGeometry(id displayView, CGSize displaySize) {
             DFSetCGSizeIvar(chromeRenderView, "displaySize", displaySize);
         }
     }
+}
+
+static NSArray *DFChromeInputsForDisplayView(id displayView) {
+    if (displayView == nil) {
+        return nil;
+    }
+
+    id chromeView = DFGetObjectIvar(displayView, "chromeView");
+    if (chromeView == nil) {
+        return nil;
+    }
+
+    id inputs = DFGetObjectIvar(chromeView, "_inputs");
+    return [inputs isKindOfClass:[NSArray class]] ? inputs : nil;
+}
+
+static id DFChromeInputButton(id chromeInput) {
+    return DFGetObjectIvar(chromeInput, "_button");
+}
+
+static id DFChromeInputDescriptorObject(id chromeInput) {
+    return DFGetObjectIvar(chromeInput, "input");
+}
+
+static NSString *DFChromeInputIdentifier(id chromeInput) {
+    NSString *uuid = DFTrimmedString(DFOptionalStringFromObjectSelector(chromeInput, "uuid"));
+    if (uuid.length > 0) {
+        return uuid;
+    }
+
+    id button = DFChromeInputButton(chromeInput);
+    id identifier = button != nil ? DFSendObject(button, "identifier") : nil;
+    if ([identifier respondsToSelector:@selector(description)]) {
+        NSString *description = DFTrimmedString([identifier description]);
+        if (description.length > 0) {
+            return description;
+        }
+    }
+
+    NSString *title = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "title"));
+    if (title.length > 0) {
+        return [@"title:" stringByAppendingString:title];
+    }
+
+    NSString *toolTip = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "toolTip"));
+    if (toolTip.length > 0) {
+        return [@"tooltip:" stringByAppendingString:toolTip];
+    }
+
+    NSString *accessibilityLabel = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "accessibilityLabel"));
+    if (accessibilityLabel.length > 0) {
+        return [@"ax:" stringByAppendingString:accessibilityLabel];
+    }
+
+    id input = DFChromeInputDescriptorObject(chromeInput);
+    if (input != nil) {
+        NSString *inputDescription = DFTrimmedString([input respondsToSelector:@selector(description)] ? [input description] : nil);
+        if (inputDescription.length > 0) {
+            return [@"input:" stringByAppendingString:inputDescription];
+        }
+    }
+
+    return [NSString stringWithFormat:@"ptr:%p", chromeInput];
+}
+
+static NSString *DFChromeInputSummary(id chromeInput) {
+    if (chromeInput == nil) {
+        return @"<nil>";
+    }
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+
+    NSString *uuid = DFOptionalStringFromObjectSelector(chromeInput, "uuid");
+    if (uuid.length > 0) {
+        [parts addObject:[NSString stringWithFormat:@"uuid=%@", uuid]];
+    }
+
+    id button = DFChromeInputButton(chromeInput);
+    if (button != nil) {
+        NSString *title = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "title"));
+        if (title.length > 0) {
+            [parts addObject:[NSString stringWithFormat:@"title=%@", title]];
+        }
+
+        NSString *toolTip = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "toolTip"));
+        if (toolTip.length > 0) {
+            [parts addObject:[NSString stringWithFormat:@"toolTip=%@", toolTip]];
+        }
+
+        NSString *accessibilityLabel = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "accessibilityLabel"));
+        if (accessibilityLabel.length > 0) {
+            [parts addObject:[NSString stringWithFormat:@"ax=%@", accessibilityLabel]];
+        }
+
+        id identifier = DFSendObject(button, "identifier");
+        if ([identifier respondsToSelector:@selector(description)]) {
+            NSString *identifierDescription = DFTrimmedString([identifier description]);
+            if (identifierDescription.length > 0) {
+                [parts addObject:[NSString stringWithFormat:@"identifier=%@", identifierDescription]];
+            }
+        }
+    }
+
+    id input = DFChromeInputDescriptorObject(chromeInput);
+    if (input != nil) {
+        NSString *inputClass = NSStringFromClass([input class]);
+        if (inputClass.length > 0) {
+            [parts addObject:[NSString stringWithFormat:@"inputClass=%@", inputClass]];
+        }
+
+        if ([input respondsToSelector:@selector(description)]) {
+            NSString *inputDescription = DFTrimmedString([input description]);
+            if (inputDescription.length > 0 && ![inputDescription isEqualToString:inputClass]) {
+                [parts addObject:[NSString stringWithFormat:@"input=%@", inputDescription]];
+            }
+        }
+    }
+
+    if (parts.count == 0) {
+        return NSStringFromClass([chromeInput class]);
+    }
+
+    return [parts componentsJoinedByString:@", "];
+}
+
+static BOOL DFChromeInputMatchesHome(id chromeInput) {
+    NSString *summary = DFChromeInputSummary(chromeInput).lowercaseString;
+    return [summary containsString:@"home"];
+}
+
+static BOOL DFTriggerChromeInput(id chromeInput, NSError **error) {
+    if (chromeInput == nil) {
+        return NO;
+    }
+
+    SEL selector = sel_registerName("buttonClicked:");
+    if (![chromeInput respondsToSelector:selector]) {
+        if (error != NULL) {
+            *error = DFMakeError(
+                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+                @"SimulatorKit chrome input did not expose buttonClicked:."
+            );
+        }
+        return NO;
+    }
+
+    id button = DFChromeInputButton(chromeInput);
+    ((void(*)(id, SEL, id))objc_msgSend)(chromeInput, selector, button);
+    return YES;
+}
+
+static id DFFindChromeInputForIdentifier(id displayView, NSString *identifier) {
+    if (identifier.length == 0) {
+        return nil;
+    }
+
+    for (id chromeInput in DFChromeInputsForDisplayView(displayView)) {
+        if ([DFChromeInputIdentifier(chromeInput) isEqualToString:identifier]) {
+            return chromeInput;
+        }
+    }
+
+    return nil;
+}
+
+static NSArray *DFSubviewsForObject(id object) {
+    if (object == nil || ![object respondsToSelector:@selector(subviews)]) {
+        return @[];
+    }
+
+    id subviews = ((id(*)(id, SEL))objc_msgSend)(object, @selector(subviews));
+    return [subviews isKindOfClass:[NSArray class]] ? subviews : @[];
+}
+
+static NSArray<id> *DFFlattenViewTree(id root) {
+    if (root == nil) {
+        return @[];
+    }
+
+    NSMutableArray<id> *orderedViews = [NSMutableArray array];
+    NSMutableArray<id> *pending = [NSMutableArray arrayWithObject:root];
+    NSMutableSet<NSValue *> *visited = [NSMutableSet set];
+
+    while (pending.count > 0) {
+        id candidate = pending.lastObject;
+        [pending removeLastObject];
+
+        NSValue *pointerValue = [NSValue valueWithPointer:(__bridge const void *)candidate];
+        if ([visited containsObject:pointerValue]) {
+            continue;
+        }
+
+        [visited addObject:pointerValue];
+        [orderedViews addObject:candidate];
+
+        NSArray *subviews = DFSubviewsForObject(candidate);
+        for (id subview in [subviews reverseObjectEnumerator]) {
+            [pending addObject:subview];
+        }
+    }
+
+    return orderedViews;
+}
+
+static NSString *DFButtonLikeControlIdentifier(id control) {
+    if (control == nil) {
+        return nil;
+    }
+
+    return [NSString stringWithFormat:@"button:%p", control];
+}
+
+static NSString *DFButtonLikeControlTitle(id control) {
+    return DFTrimmedString(DFOptionalStringFromObjectSelector(control, "title"));
+}
+
+static NSString *DFButtonLikeControlToolTip(id control) {
+    return DFTrimmedString(DFOptionalStringFromObjectSelector(control, "toolTip"));
+}
+
+static NSString *DFButtonLikeControlAccessibilityLabel(id control) {
+    return DFTrimmedString(DFOptionalStringFromObjectSelector(control, "accessibilityLabel"));
+}
+
+static NSString *DFButtonLikeControlSummary(id control) {
+    if (control == nil) {
+        return @"<nil>";
+    }
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    [parts addObject:[NSString stringWithFormat:@"class=%@", NSStringFromClass([control class])]];
+
+    NSString *title = DFButtonLikeControlTitle(control);
+    if (title.length > 0) {
+        [parts addObject:[NSString stringWithFormat:@"title=%@", title]];
+    }
+
+    NSString *toolTip = DFButtonLikeControlToolTip(control);
+    if (toolTip.length > 0) {
+        [parts addObject:[NSString stringWithFormat:@"toolTip=%@", toolTip]];
+    }
+
+    NSString *accessibilityLabel = DFButtonLikeControlAccessibilityLabel(control);
+    if (accessibilityLabel.length > 0) {
+        [parts addObject:[NSString stringWithFormat:@"ax=%@", accessibilityLabel]];
+    }
+
+    if ([control respondsToSelector:@selector(identifier)]) {
+        id identifier = ((id(*)(id, SEL))objc_msgSend)(control, @selector(identifier));
+        if ([identifier respondsToSelector:@selector(description)]) {
+            NSString *identifierDescription = DFTrimmedString([identifier description]);
+            if (identifierDescription.length > 0) {
+                [parts addObject:[NSString stringWithFormat:@"identifier=%@", identifierDescription]];
+            }
+        }
+    }
+
+    return [parts componentsJoinedByString:@", "];
+}
+
+static BOOL DFButtonLikeControlLooksInteractive(id control) {
+    if (control == nil) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass([control class]).lowercaseString;
+    if ([className containsString:@"button"]) {
+        return YES;
+    }
+
+    if ([control respondsToSelector:sel_registerName("performClick:")]) {
+        return YES;
+    }
+
+    if ([control respondsToSelector:@selector(action)] && [control respondsToSelector:@selector(target)]) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static NSArray<id> *DFButtonLikeControlsForDisplayView(id displayView) {
+    if (displayView == nil) {
+        return @[];
+    }
+
+    id chromeView = DFGetObjectIvar(displayView, "chromeView");
+    NSArray<id> *viewTree = DFFlattenViewTree(chromeView ?: displayView);
+    NSMutableArray<id> *controls = [NSMutableArray array];
+
+    for (id view in viewTree) {
+        if (!DFButtonLikeControlLooksInteractive(view)) {
+            continue;
+        }
+
+        NSString *title = DFButtonLikeControlTitle(view);
+        NSString *toolTip = DFButtonLikeControlToolTip(view);
+        NSString *accessibilityLabel = DFButtonLikeControlAccessibilityLabel(view);
+        if (title.length == 0 && toolTip.length == 0 && accessibilityLabel.length == 0) {
+            continue;
+        }
+
+        [controls addObject:view];
+    }
+
+    return controls;
+}
+
+static id DFFindButtonLikeControlForIdentifier(id displayView, NSString *identifier) {
+    if (identifier.length == 0) {
+        return nil;
+    }
+
+    for (id control in DFButtonLikeControlsForDisplayView(displayView)) {
+        if ([DFButtonLikeControlIdentifier(control) isEqualToString:identifier]) {
+            return control;
+        }
+    }
+
+    return nil;
+}
+
+static BOOL DFTriggerButtonLikeControl(id control, NSError **error) {
+    if (control == nil) {
+        return NO;
+    }
+
+    SEL performClickSelector = sel_registerName("performClick:");
+    if ([control respondsToSelector:performClickSelector]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(control, performClickSelector, nil);
+        return YES;
+    }
+
+    SEL accessibilityPressSelector = sel_registerName("accessibilityPerformPress");
+    if ([control respondsToSelector:accessibilityPressSelector]) {
+        BOOL didPress = ((BOOL(*)(id, SEL))objc_msgSend)(control, accessibilityPressSelector);
+        if (didPress) {
+            return YES;
+        }
+    }
+
+    if ([control respondsToSelector:@selector(action)] && [control respondsToSelector:@selector(target)]) {
+        SEL action = ((SEL(*)(id, SEL))objc_msgSend)(control, @selector(action));
+        id target = ((id(*)(id, SEL))objc_msgSend)(control, @selector(target));
+        if (action != NULL && target != nil && [NSApp sendAction:action to:target from:control]) {
+            return YES;
+        }
+    }
+
+    if (error != NULL) {
+        *error = DFMakeError(
+            DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+            @"SimulatorKit exposed a control view, but it did not respond to performClick:, accessibilityPerformPress, or action dispatch."
+        );
+    }
+    return NO;
+}
+
+static void DFLogChromeRuntimeState(id displayView) {
+    if (displayView == nil) {
+        DFLog(@"displayView is nil");
+        return;
+    }
+
+    id chromeView = DFGetObjectIvar(displayView, "chromeView");
+    DFLogRuntimeShape(chromeView, @"chromeView");
+
+    id chromeRenderView = DFGetObjectIvar(chromeView, "_renderView");
+    if (chromeRenderView != nil) {
+        DFLogRuntimeShape(chromeRenderView, @"chromeRenderView");
+    }
+
+    NSArray *chromeInputs = DFChromeInputsForDisplayView(displayView) ?: @[];
+    NSMutableArray<NSString *> *inputSummaries = [NSMutableArray arrayWithCapacity:chromeInputs.count];
+    for (id chromeInput in chromeInputs) {
+        [inputSummaries addObject:DFChromeInputSummary(chromeInput)];
+    }
+    DFLog(@"SimulatorKit chrome inputs: %@", inputSummaries);
+
+    NSArray *buttonLikeControls = DFButtonLikeControlsForDisplayView(displayView);
+    NSMutableArray<NSString *> *buttonSummaries = [NSMutableArray arrayWithCapacity:buttonLikeControls.count];
+    for (id control in buttonLikeControls) {
+        [buttonSummaries addObject:DFButtonLikeControlSummary(control)];
+    }
+    DFLog(@"SimulatorKit button-like controls: %@", buttonSummaries);
 }
 
 static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDown, NSError **error) {
@@ -842,9 +1763,125 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
     return DFSendHIDMessage(hidClient, message, YES, error);
 }
 
+typedef struct {
+    const char *label;
+    BOOL useButton;
+    uint32_t buttonCode;
+    uint32_t consumerPage;
+    uint32_t consumerUsage;
+    uint32_t target;
+} DFHomeButtonHIDStrategy;
+
+static BOOL DFSendHomeStrategyEdge(id hidClient, const DFHomeButtonHIDStrategy *strategy, uint32_t operation, NSError **error) {
+    IndigoHIDMessage *message = strategy->useButton
+        ? DFCreateButtonMessage(strategy->buttonCode, operation, strategy->target, error)
+        : DFCreateArbitraryHIDMessage(strategy->target, strategy->consumerPage, strategy->consumerUsage, operation, error);
+    if (message == NULL) {
+        return NO;
+    }
+    return DFSendHIDMessage(hidClient, message, YES, error);
+}
+
+static BOOL DFPressHomeViaHIDClient(id hidClient, NSError **error) {
+    if (hidClient == nil) {
+        if (error != NULL) {
+            *error = DFMakeError(
+                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+                @"SimulatorKit did not provide a headless HID client for Home."
+            );
+        }
+        return NO;
+    }
+
+    // Ordered from most likely correct to last-resort. Each entry gets a press+release;
+    // the first strategy that SimulatorKit accepts wins. Labels are logged so you can
+    // cross-reference the private bridge log against whatever iOS actually did.
+    //
+    // The consumer-control paths are tried first because the IndigoButton path with
+    // code=0x191 is accepted by some runtimes but routed to a different hardware
+    // button (observed on macOS 26 simulators as a reboot trigger). The usage-page
+    // 0x0c / usage 0x40 (Menu) is the documented fbsimctl mapping for iOS Home.
+    static const DFHomeButtonHIDStrategy strategies[] = {
+        // USB consumer-control Menu (0x0c/0x40) — the documented iOS Home mapping
+        // used by fbsimctl / idb; works on both Face ID and Touch ID simulators.
+        { "IndigoHIDMessageForHIDArbitrary page=0x0c usage=0x40 (Menu) target=0x32", NO, 0, DFConsumerControlUsagePage, 0x40, DFIndigoTouchTarget },
+        // Older iOS builds exposed Home directly at usage 0x65 on the consumer page.
+        { "IndigoHIDMessageForHIDArbitrary page=0x0c usage=0x65 (Home) target=0x32", NO, 0, DFConsumerControlUsagePage, DFHomeConsumerUsage, DFIndigoTouchTarget },
+        // Legacy IndigoButton paths — may be rejected, accepted-but-misrouted, or
+        // correctly map to Home depending on the SimulatorKit build. Kept as a last
+        // resort after the documented consumer-control paths.
+        { "IndigoHIDMessageForButton code=0x191 target=0x2",  YES, DFHomeButtonCode, 0, 0, 0x2 },
+        { "IndigoHIDMessageForButton code=0x191 target=0x32", YES, DFHomeButtonCode, 0, 0, DFIndigoTouchTarget },
+    };
+
+    NSError *lastError = nil;
+    for (size_t index = 0; index < sizeof(strategies) / sizeof(strategies[0]); index++) {
+        const DFHomeButtonHIDStrategy *strategy = &strategies[index];
+
+        NSError *downError = nil;
+        if (!DFSendHomeStrategyEdge(hidClient, strategy, DFButtonDirectionDown, &downError)) {
+            DFLog(@"Home strategy rejected (down): %s — %@", strategy->label, downError.localizedDescription ?: @"no error");
+            lastError = downError;
+            continue;
+        }
+
+        [NSThread sleepForTimeInterval:0.08];
+
+        NSError *upError = nil;
+        if (!DFSendHomeStrategyEdge(hidClient, strategy, DFButtonDirectionUp, &upError)) {
+            DFLog(@"Home strategy rejected (up): %s — %@", strategy->label, upError.localizedDescription ?: @"no error");
+            lastError = upError;
+            continue;
+        }
+
+        DFLog(@"Home dispatched via %s", strategy->label);
+        return YES;
+    }
+
+    if (error != NULL) {
+        *error = lastError ?: DFMakeError(
+            DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+            @"SimulatorKit rejected every Home HID strategy."
+        );
+    }
+    return NO;
+}
+
 @interface DFPrivateSimulatorDisplayBridge ()
 
 @property (nonatomic, strong) NSView *displayView;
+
+@end
+
+@interface DFPrivateSimulatorChromeButton ()
+
+- (instancetype)initWithIdentifier:(NSString *)identifier
+                             title:(NSString *)title
+                           toolTip:(NSString *)toolTip
+                accessibilityLabel:(NSString *)accessibilityLabel
+                           summary:(NSString *)summary;
+
+@end
+
+@implementation DFPrivateSimulatorChromeButton
+
+- (instancetype)initWithIdentifier:(NSString *)identifier
+                             title:(NSString *)title
+                           toolTip:(NSString *)toolTip
+                accessibilityLabel:(NSString *)accessibilityLabel
+                           summary:(NSString *)summary {
+    self = [super init];
+    if (self == nil) {
+        return nil;
+    }
+
+    _identifier = [identifier copy];
+    _title = [title copy];
+    _toolTip = [toolTip copy];
+    _accessibilityLabel = [accessibilityLabel copy];
+    _summary = [summary copy];
+    return self;
+}
 
 @end
 
@@ -871,6 +1908,7 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
     BOOL _isActivatingDisplay;
     BOOL _hasActivatedDisplay;
     BOOL _digitizerInputReady;
+    double _deviceRotationDegrees;
 }
 
 + (BOOL)loadPrivateFrameworks:(NSError **)error {
@@ -1042,7 +2080,12 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
         DFLog(@"SimulatorKit legacy HID client class was unavailable.");
     }
 
-    _screenAdapterHost = DFCallSwiftSelfGetter(_device, "$sSo9SimDeviceC12SimulatorKitE13screenAdapterAC0ab6ScreenF0CSgvg");
+    _screenAdapterHost = DFCallSwiftSelfGetterByPattern(
+        _device,
+        "$sSo9SimDeviceC12SimulatorKitE13screenAdapter",
+        "vg",
+        "SimDevice.screenAdapter.getter (SimulatorKit extension)"
+    );
     if (_screenAdapterHost == nil) {
         if (error != NULL) {
             *error = DFMakeError(
@@ -1104,9 +2147,17 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
     );
 
     [self updateStatus:@"Waiting for headless simulator screens"];
-    DFSpinRunLoop(0.5);
 
+    // Xcode 26.4's SimulatorKit doesn't expose adapter screens immediately after
+    // the bootstrap SimDeviceScreen is allocated — they trickle in over a few
+    // seconds (or only after Simulator.app primes the device). Poll instead of
+    // relying on a fixed 0.5s sleep.
     NSDictionary<NSNumber *, id> *screens = DFReadAdapterScreens(_screenAdapterHost);
+    NSDate *screenDeadline = [NSDate dateWithTimeIntervalSinceNow:10.0];
+    while (screens.count == 0 && [screenDeadline timeIntervalSinceNow] > 0) {
+        DFSpinRunLoop(0.1);
+        screens = DFReadAdapterScreens(_screenAdapterHost);
+    }
     if (screens.count == 0) {
         if (error != NULL) {
             *error = DFMakeError(
@@ -1275,16 +2326,23 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
         id renderableView = [self->_displayView respondsToSelector:sel_registerName("renderableView")]
             ? DFSendObject(self->_displayView, "renderableView")
             : nil;
-
         if (renderableView == nil) {
             activationError = DFMakeError(
                 DFPrivateSimulatorErrorCodeDisplayAttachFailed,
                 @"SimulatorKit did not expose a renderable view for the private display."
             );
         } else {
-            static const char *renderableConnectSymbol = "$s12SimulatorKit24SimDisplayRenderableViewC7connect6screenyAA0C12DeviceScreenC_tFTj";
-
-            if (!DFCallSwiftVoidMethodWithSelfAndObject(renderableView, self->_activeScreen, renderableConnectSymbol)) {
+            // SimulatorKit.SimDisplayRenderableView.connect(screen:) — the ObjC
+            // dispatch thunk (`Tj`) suffix is stable; the middle of the mangling
+            // (parameter type) is what drifts.
+            BOOL connected = DFCallSwiftVoidMethodWithSelfAndObjectByPattern(
+                renderableView,
+                self->_activeScreen,
+                "$s12SimulatorKit24SimDisplayRenderableViewC7connect",
+                "FTj",
+                "SimDisplayRenderableView.connect(screen:)"
+            );
+            if (!connected) {
                 activationError = DFMakeError(
                     DFPrivateSimulatorErrorCodeDisplayAttachFailed,
                     @"Failed to locate SimulatorKit renderableView.connect(screen:)."
@@ -1305,6 +2363,29 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
         self->_isActivatingDisplay = NO;
         [self updateStatus:@"Private SimulatorKit display attached"];
         DFLog(@"Activated SimulatorKit private display attach for screen %u", self->_activeScreenID);
+
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf == nil) {
+                return;
+            }
+
+            id chromeView = strongSelf->_displayView != nil
+                ? DFGetObjectIvar(strongSelf->_displayView, "chromeView")
+                : nil;
+            if (chromeView != nil) {
+                DFSetBoolIvar(chromeView, "isEnabled", YES);
+            }
+
+            DFLogChromeRuntimeState(strongSelf->_displayView);
+            NSArray<DFPrivateSimulatorChromeButton *> *buttons = [strongSelf availableChromeButtons];
+            NSMutableArray<NSString *> *summaries = [NSMutableArray arrayWithCapacity:buttons.count];
+            for (DFPrivateSimulatorChromeButton *button in buttons) {
+                [summaries addObject:button.summary];
+            }
+            DFLog(@"Post-attach SimulatorKit chrome buttons: %@", summaries);
+        });
     });
 }
 
@@ -1325,59 +2406,189 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
     return pixelBuffer;
 }
 
+- (NSArray<DFPrivateSimulatorChromeButton *> *)availableChromeButtons {
+    __block NSArray<DFPrivateSimulatorChromeButton *> *buttons = @[];
+
+    dispatch_block_t work = ^{
+        NSMutableArray<DFPrivateSimulatorChromeButton *> *mappedButtons = [NSMutableArray array];
+        NSMutableSet<NSString *> *seenIdentifiers = [NSMutableSet set];
+        for (id chromeInput in DFChromeInputsForDisplayView(self->_displayView)) {
+            NSString *identifier = DFChromeInputIdentifier(chromeInput);
+            if (identifier.length == 0 || [seenIdentifiers containsObject:identifier]) {
+                continue;
+            }
+            [seenIdentifiers addObject:identifier];
+            id button = DFChromeInputButton(chromeInput);
+            NSString *title = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "title")) ?: @"";
+            NSString *toolTip = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "toolTip")) ?: @"";
+            NSString *accessibilityLabel = DFTrimmedString(DFOptionalStringFromObjectSelector(button, "accessibilityLabel")) ?: @"";
+            NSString *summary = DFChromeInputSummary(chromeInput);
+
+            [mappedButtons addObject:[[DFPrivateSimulatorChromeButton alloc] initWithIdentifier:identifier
+                                                                                          title:title
+                                                                                        toolTip:toolTip
+                                                                             accessibilityLabel:accessibilityLabel
+                                                                                        summary:summary]];
+        }
+
+        for (id control in DFButtonLikeControlsForDisplayView(self->_displayView)) {
+            NSString *identifier = DFButtonLikeControlIdentifier(control);
+            if (identifier.length == 0 || [seenIdentifiers containsObject:identifier]) {
+                continue;
+            }
+            [seenIdentifiers addObject:identifier];
+
+            NSString *title = DFButtonLikeControlTitle(control) ?: @"";
+            NSString *toolTip = DFButtonLikeControlToolTip(control) ?: @"";
+            NSString *accessibilityLabel = DFButtonLikeControlAccessibilityLabel(control) ?: @"";
+            NSString *summary = DFButtonLikeControlSummary(control);
+
+            [mappedButtons addObject:[[DFPrivateSimulatorChromeButton alloc] initWithIdentifier:identifier
+                                                                                          title:title
+                                                                                        toolTip:toolTip
+                                                                             accessibilityLabel:accessibilityLabel
+                                                                                        summary:summary]];
+        }
+
+        buttons = [mappedButtons copy];
+    };
+
+    if (dispatch_get_specific(DFPrivateSimulatorCallbackQueueKey) != NULL) {
+        work();
+    } else {
+        dispatch_sync(_callbackQueue, work);
+    }
+
+    return buttons;
+}
+
+- (BOOL)pressChromeButtonWithIdentifier:(NSString *)identifier error:(NSError * _Nullable __autoreleasing *)error {
+    __block BOOL success = NO;
+    __block NSError *dispatchError = nil;
+
+    dispatch_block_t work = ^{
+        id chromeInput = DFFindChromeInputForIdentifier(self->_displayView, identifier);
+        if (chromeInput != nil) {
+            NSError *chromeError = nil;
+            if (!DFTriggerChromeInput(chromeInput, &chromeError)) {
+                dispatchError = chromeError ?: DFMakeError(
+                    DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+                    [NSString stringWithFormat:@"SimulatorKit rejected chrome button %@.", identifier]
+                );
+                return;
+            }
+
+            DFLog(@"Triggered private SimulatorKit chrome input: %@", DFChromeInputSummary(chromeInput));
+            success = YES;
+            return;
+        }
+
+        id control = DFFindButtonLikeControlForIdentifier(self->_displayView, identifier);
+        if (control == nil) {
+            dispatchError = DFMakeError(
+                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+                [NSString stringWithFormat:@"SimulatorKit did not expose a chrome control for identifier %@.", identifier]
+            );
+            return;
+        }
+
+        NSError *controlError = nil;
+        if (!DFTriggerButtonLikeControl(control, &controlError)) {
+            dispatchError = controlError ?: DFMakeError(
+                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+                [NSString stringWithFormat:@"SimulatorKit rejected chrome control %@.", identifier]
+            );
+            return;
+        }
+
+        DFLog(@"Triggered private SimulatorKit button-like control: %@", DFButtonLikeControlSummary(control));
+        success = YES;
+    };
+
+    if (dispatch_get_specific(DFPrivateSimulatorCallbackQueueKey) != NULL) {
+        work();
+    } else {
+        dispatch_sync(_callbackQueue, work);
+    }
+
+    if (!success && error != NULL) {
+        *error = dispatchError;
+    }
+
+    return success;
+}
+
 - (BOOL)pressHomeButton:(NSError * _Nullable __autoreleasing *)error {
     __block BOOL success = NO;
     __block NSError *dispatchError = nil;
 
     dispatch_block_t work = ^{
-        if (self->_hidClient == nil || self->_activeScreen == nil) {
-            dispatchError = DFMakeError(
-                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
-                @"SimulatorKit did not provide a live hardware button target."
-            );
-            return;
+        // Prefer Simulator.app's own chrome affordance when available (iPhone 8 / SE
+        // with the Touch ID bezel). This goes through the same code path as clicking
+        // the modeled Home button in the Simulator window — guaranteed not to reboot.
+        NSArray *chromeInputs = DFChromeInputsForDisplayView(self->_displayView);
+        for (id chromeInput in chromeInputs) {
+            if (!DFChromeInputMatchesHome(chromeInput)) {
+                continue;
+            }
+
+            NSError *chromeError = nil;
+            if (DFTriggerChromeInput(chromeInput, &chromeError)) {
+                DFLog(@"Triggered private SimulatorKit Home chrome input: %@", DFChromeInputSummary(chromeInput));
+                success = YES;
+                return;
+            }
+
+            DFLog(@"Failed to trigger Home chrome input %@: %@", DFChromeInputSummary(chromeInput), chromeError.localizedDescription);
         }
 
-        uint32_t target = DFCallSwiftSelfGetterU32(self->_activeScreen, "$s12SimulatorKit15SimDeviceScreenC12buttonTargetSo15IndigoHIDTargetVvg");
-        if (target == 0) {
-            dispatchError = DFMakeError(
-                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
-                @"SimulatorKit did not expose a hardware button target for this screen."
-            );
-            return;
+        NSArray *buttonLikeControls = DFButtonLikeControlsForDisplayView(self->_displayView);
+        for (id control in buttonLikeControls) {
+            NSString *summary = DFButtonLikeControlSummary(control);
+            if (![summary.lowercaseString containsString:@"home"]) {
+                continue;
+            }
+
+            NSError *controlError = nil;
+            if (DFTriggerButtonLikeControl(control, &controlError)) {
+                DFLog(@"Triggered private SimulatorKit Home button-like control: %@", summary);
+                success = YES;
+                return;
+            }
+
+            DFLog(@"Failed to trigger Home button-like control %@: %@", summary, controlError.localizedDescription);
         }
 
-        NSError *messageError = nil;
-        IndigoHIDMessage *buttonDown = DFCreateButtonMessage(DFHomeButtonCode, DFButtonDirectionDown, target, &messageError);
-        if (buttonDown == NULL) {
-            dispatchError = messageError;
+        // Fallback: drive the private Indigo HID client directly. Required for
+        // Face ID devices where Simulator.app doesn't render a chrome Home button.
+        NSError *hidError = nil;
+        if (DFPressHomeViaHIDClient(self->_hidClient, &hidError)) {
+            success = YES;
             return;
         }
+        DFLog(@"HID Home path failed after chrome fallback: %@", hidError.localizedDescription ?: @"unknown error");
 
-        if (!DFSendHIDMessage(self->_hidClient, buttonDown, YES, &messageError)) {
-            dispatchError = messageError ?: DFMakeError(
-                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
-                @"SimulatorKit rejected the Home button-down HID packet."
-            );
-            return;
+        if (chromeInputs.count > 0) {
+            NSMutableArray<NSString *> *summaries = [NSMutableArray arrayWithCapacity:chromeInputs.count];
+            for (id chromeInput in chromeInputs) {
+                [summaries addObject:DFChromeInputSummary(chromeInput)];
+            }
+            DFLog(@"Available SimulatorKit chrome inputs: %@", summaries);
         }
 
-        IndigoHIDMessage *buttonUp = DFCreateButtonMessage(DFHomeButtonCode, DFButtonDirectionUp, target, &messageError);
-        if (buttonUp == NULL) {
-            dispatchError = messageError;
-            return;
+        if (buttonLikeControls.count > 0) {
+            NSMutableArray<NSString *> *summaries = [NSMutableArray arrayWithCapacity:buttonLikeControls.count];
+            for (id control in buttonLikeControls) {
+                [summaries addObject:DFButtonLikeControlSummary(control)];
+            }
+            DFLog(@"Available SimulatorKit button-like controls: %@", summaries);
         }
 
-        if (!DFSendHIDMessage(self->_hidClient, buttonUp, YES, &messageError)) {
-            dispatchError = messageError ?: DFMakeError(
-                DFPrivateSimulatorErrorCodeTouchDispatchFailed,
-                @"SimulatorKit rejected the Home button-up HID packet."
-            );
-            return;
-        }
-
-        DFLog(@"Sending Home hardware button HID to target %u", target);
-        success = YES;
+        dispatchError = hidError ?: DFMakeError(
+            DFPrivateSimulatorErrorCodeTouchDispatchFailed,
+            @"No Home path succeeded (no chrome Home control, HID strategies rejected)."
+        );
+        return;
     };
 
     if (dispatch_get_specific(DFPrivateSimulatorCallbackQueueKey) != NULL) {
@@ -1398,18 +2609,23 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
     __block NSError *dispatchError = nil;
 
     dispatch_block_t work = ^{
-        static const char *displayViewGetter = "$s12SimulatorKit14SimDisplayViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvgTj";
-        static const char *displayViewSetter = "$s12SimulatorKit14SimDisplayViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvsTj";
-        static const char *chromeGetter = "$s12SimulatorKit20SimDisplayChromeViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvgTj";
-        static const char *chromeSetter = "$s12SimulatorKit20SimDisplayChromeViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvsTj";
-        static const char *chromeRenderGetter = "$s12SimulatorKit26SimDisplayChromeRenderViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvgTj";
-        static const char *chromeRenderSetter = "$s12SimulatorKit26SimDisplayChromeRenderViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvsTj";
-        static const char *digitizerGetter = "$s12SimulatorKit21SimDigitizerInputViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvgTj";
-        static const char *digitizerSetter = "$s12SimulatorKit21SimDigitizerInputViewC14deviceRotation10Foundation11MeasurementVySo11NSUnitAngleCGvsTj";
+        // Resolve `<View>.deviceRotation` getter/setter ObjC-thunks by stable
+        // mangled prefix; the Foundation.Measurement type tail in the middle is
+        // what shifts across Xcodes.
+        static const char *displayViewPrefix    = "$s12SimulatorKit14SimDisplayViewC14deviceRotation";
+        static const char *chromePrefix         = "$s12SimulatorKit20SimDisplayChromeViewC14deviceRotation";
+        static const char *chromeRenderPrefix   = "$s12SimulatorKit26SimDisplayChromeRenderViewC14deviceRotation";
+        static const char *digitizerPrefix      = "$s12SimulatorKit21SimDigitizerInputViewC14deviceRotation";
+        static const char *getterSuffix         = "vgTj";
 
-        __block DFUnitAngleMeasurement measurement = { [NSUnitAngle degrees], 0 };
-        __block BOOL updatedDisplayRotation = NO;
-        __block NSInteger orientationValue = 1;
+        // Seed the next target rotation from whatever SimulatorKit exposes (if anything).
+        // If every getter is missing on this Xcode/macOS build, fall back to our locally
+        // tracked ivar so the device still rotates even when we can't read SimulatorKit's
+        // internal rotation state.
+        __block DFUnitAngleMeasurement measurement = { [NSUnitAngle degrees], self->_deviceRotationDegrees };
+        __block BOOL readFromSimulatorKit = NO;
+        __block BOOL viewsUpdated = NO;
+
         DFRunOnMainSync(^{
             DFConfigureDisplayGeometry(self->_displayView, self->_displayPixelSize);
 
@@ -1420,52 +2636,69 @@ static BOOL DFSendSingleKeyboardEvent(id hidClient, uint16_t keyCode, BOOL keyDo
                 ? object_getIvar(chromeView, DFGetIvar(chromeView, "_renderView"))
                 : nil;
 
-            updatedDisplayRotation = DFCallSwiftUnitAngleMeasurementGetter(self->_displayView, displayViewGetter, &measurement);
-            if (!updatedDisplayRotation) {
-                updatedDisplayRotation = DFCallSwiftUnitAngleMeasurementGetter(chromeView, chromeGetter, &measurement);
-            }
-            if (!updatedDisplayRotation) {
-                updatedDisplayRotation = DFCallSwiftUnitAngleMeasurementGetter(self->_digitizerInputView, digitizerGetter, &measurement);
-            }
-            if (!updatedDisplayRotation) {
-                return;
+            DFUnitAngleMeasurement readMeasurement = { [NSUnitAngle degrees], 0 };
+            if (DFCallSwiftUnitAngleMeasurementGetterByPattern(self->_displayView,        displayViewPrefix, getterSuffix, "SimDisplayView.deviceRotation.getter",        &readMeasurement) ||
+                DFCallSwiftUnitAngleMeasurementGetterByPattern(chromeView,                chromePrefix,      getterSuffix, "SimDisplayChromeView.deviceRotation.getter",  &readMeasurement) ||
+                DFCallSwiftUnitAngleMeasurementGetterByPattern(self->_digitizerInputView, digitizerPrefix,   getterSuffix, "SimDigitizerInputView.deviceRotation.getter", &readMeasurement)) {
+                readFromSimulatorKit = YES;
+                measurement = readMeasurement;
+                if (measurement.unit == nil) {
+                    measurement.unit = [NSUnitAngle degrees];
+                }
             }
 
-            if (measurement.unit == nil) {
-                measurement.unit = [NSUnitAngle degrees];
-            }
             measurement.value = DFNormalizedDegrees(measurement.value + 90.0);
-            orientationValue = DFOrientationEquivalentValueForMeasurement(measurement);
+            self->_deviceRotationDegrees = measurement.value;
 
-            updatedDisplayRotation = NO;
-            updatedDisplayRotation |= DFSetDisplayRotationMeasurement(self->_displayView, measurement, displayViewSetter);
-            updatedDisplayRotation |= DFSetDisplayRotationMeasurement(chromeView, measurement, chromeSetter);
-            updatedDisplayRotation |= DFSetDisplayRotationMeasurement(chromeRenderView, measurement, chromeRenderSetter);
-            updatedDisplayRotation |= DFSetDisplayRotationMeasurement(self->_digitizerInputView, measurement, digitizerSetter);
+            if (readFromSimulatorKit) {
+                viewsUpdated |= DFSetDisplayRotationMeasurement(self->_displayView,        measurement, displayViewPrefix,  "SimDisplayView.deviceRotation.setter");
+                viewsUpdated |= DFSetDisplayRotationMeasurement(chromeView,                measurement, chromePrefix,       "SimDisplayChromeView.deviceRotation.setter");
+                viewsUpdated |= DFSetDisplayRotationMeasurement(chromeRenderView,          measurement, chromeRenderPrefix, "SimDisplayChromeRenderView.deviceRotation.setter");
+                viewsUpdated |= DFSetDisplayRotationMeasurement(self->_digitizerInputView, measurement, digitizerPrefix,    "SimDigitizerInputView.deviceRotation.setter");
+            }
         });
 
-        if (!updatedDisplayRotation) {
-            dispatchError = DFMakeError(
-                DFPrivateSimulatorErrorCodeDisplayAttachFailed,
-                @"SimulatorKit did not expose a mutable rotation state on the private display."
-            );
-            return;
-        }
-
+        NSInteger orientationValue = DFOrientationEquivalentValueForMeasurement(measurement);
         BOOL propagatedOrientation = DFSendDeviceOrientationEvent(self->_device, orientationValue);
 
         if (!propagatedOrientation) {
-            DFLogRuntimeShape(self->_activeScreen, @"activeScreen");
-            DFLogRuntimeShape(self->_rawScreen, @"rawScreen");
-            DFLogRuntimeShape(self->_device, @"device");
+            // Try the screen and adapter targets too — on newer SimulatorKit builds
+            // the orientation selector may live there rather than on SimDevice.
+            propagatedOrientation = DFTrySendIntegerSelectors(self->_activeScreen,      @"activeScreen",      orientationValue) ||
+                                    DFTrySendIntegerSelectors(self->_rawScreen,         @"rawScreen",         orientationValue) ||
+                                    DFTrySendIntegerSelectors(self->_screenAdapter,     @"screenAdapter",     orientationValue) ||
+                                    DFTrySendIntegerSelectors(self->_screenAdapterHost, @"screenAdapterHost", orientationValue) ||
+                                    DFTrySendIntegerSelectors(self->_serviceContext,    @"serviceContext",    orientationValue);
+        }
+
+        // On iOS 26 the GSEvent is delivered to backboardd but no longer updates
+        // UIDevice.current.orientation, so UIKit autorotation never fires. Post a
+        // Darwin notification as a side-channel that apps can observe to force a
+        // geometry update. Harmless on older iOS where autorotation still works.
+        NSString *notificationName = DFRotationNotificationNameForOrientation(orientationValue);
+        if (notificationName != nil) {
+            DFPostSimDeviceDarwinNotification(self->_device, notificationName);
+        }
+
+        if (!propagatedOrientation) {
+            DFLogRuntimeShape(self->_device,              @"device");
+            DFLogRuntimeShape(self->_activeScreen,        @"activeScreen");
+            DFLogRuntimeShape(self->_rawScreen,           @"rawScreen");
+            DFLogRuntimeShape(self->_screenAdapter,       @"screenAdapter");
+            DFLogRuntimeShape(self->_screenAdapterHost,   @"screenAdapterHost");
+            DFLogRuntimeShape(self->_serviceContext,      @"serviceContext");
+        }
+
+        if (!propagatedOrientation && !viewsUpdated) {
             dispatchError = DFMakeError(
                 DFPrivateSimulatorErrorCodeDisplayAttachFailed,
-                @"Failed to send the private simulator orientation event to the connected device."
+                @"Failed to rotate: SimulatorKit view rotation unavailable and every orientation selector rejected."
             );
             return;
         }
 
-        DFLog(@"Rotated private SimulatorKit display state to the right and sent orientation %ld", (long)orientationValue);
+        DFLog(@"Rotated to %.0f° (orientation=%ld) viewsUpdated=%d orientationSent=%d",
+              measurement.value, (long)orientationValue, viewsUpdated, propagatedOrientation);
         success = YES;
     };
 

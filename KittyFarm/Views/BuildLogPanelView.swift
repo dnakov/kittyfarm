@@ -41,29 +41,25 @@ struct BuildLogPanelView: View {
 
             if store.availableBuildLogFilters.count > 1 {
                 scopeBar
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 Divider()
+                    .transition(.opacity)
             }
 
             logList
         }
-        .frame(minHeight: 180, idealHeight: 220, maxHeight: .infinity)
-        .background(.ultraThickMaterial)
+        .animation(.smooth(duration: 0.25), value: store.availableBuildLogFilters.count > 1)
     }
 
     // MARK: - Toolbar
 
     private var toolbar: some View {
         HStack(spacing: 8) {
-            Text("Build Log")
-                .font(.subheadline.weight(.semibold))
-
             if store.isRunningBuildAndPlay {
                 ProgressView()
                     .controlSize(.small)
+                    .transition(.scale.combined(with: .opacity))
             }
-
-            countBadge(store.buildWarningCount, icon: "exclamationmark.triangle.fill", color: .yellow)
-            countBadge(store.buildErrorCount, icon: "xmark.circle.fill", color: .red)
 
             Spacer()
 
@@ -78,7 +74,7 @@ struct BuildLogPanelView: View {
                 .frame(width: 150)
 
             Button {
-                autoScroll.toggle()
+                withAnimation(.smooth(duration: 0.2)) { autoScroll.toggle() }
             } label: {
                 Image(systemName: "arrow.down.to.line.compact")
                     .foregroundStyle(autoScroll ? Color.accentColor : .secondary)
@@ -87,20 +83,17 @@ struct BuildLogPanelView: View {
             .controlSize(.small)
             .help(autoScroll ? "Auto-scroll enabled" : "Auto-scroll disabled")
 
-            Button("Clear") { store.clearBuildLogs() }
+            Button("Clear") {
+                withAnimation(.smooth(duration: 0.25)) { store.clearBuildLogs() }
+            }
                 .buttonStyle(.glass)
                 .controlSize(.small)
                 .disabled(store.buildLogs.isEmpty)
-
-            Button { store.toggleBuildLogs() } label: {
-                Image(systemName: "xmark")
-            }
-            .buttonStyle(.glass)
-            .controlSize(.small)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.bar)
+        .animation(.smooth(duration: 0.2), value: store.isRunningBuildAndPlay)
     }
 
     // MARK: - Scope Bar
@@ -110,25 +103,51 @@ struct BuildLogPanelView: View {
             HStack(spacing: 6) {
                 ForEach(store.availableBuildLogFilters) { filter in
                     filterChip(filter)
+                        .transition(.scale.combined(with: .opacity))
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
+            .animation(.smooth(duration: 0.2), value: store.availableBuildLogFilters.map(\.id))
         }
         .background(.bar)
     }
 
     // MARK: - Log List
 
+    @ViewBuilder
     private var logList: some View {
         let logs = displayedLogs
-        return LogTextView(entries: logs, autoScroll: autoScroll, timeFormatter: Self.timeFormatter) { entry in
-            sourceLabel(for: entry.source)
-        } sourceColor: { entry in
-            sourceColor(for: entry.source)
-        } messageColor: { entry in
-            messageColor(for: entry)
+        if logs.isEmpty {
+            emptyState
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .transition(.opacity)
+        } else {
+            LogTextView(entries: logs, autoScroll: autoScroll, timeFormatter: Self.timeFormatter) { entry in
+                sourceLabel(for: entry.source)
+            } sourceColor: { entry in
+                sourceColor(for: entry.source)
+            } messageColor: { entry in
+                messageColor(for: entry)
+            }
         }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 4) {
+            Image(systemName: "doc.plaintext")
+                .font(.title3)
+                .foregroundStyle(.tertiary)
+            Text(store.buildLogs.isEmpty ? "No build logs yet" : "No matching entries")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if store.buildLogs.isEmpty {
+                Text("Press ▶ to build and run")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding()
     }
 
     // MARK: - Helpers
@@ -142,7 +161,11 @@ struct BuildLogPanelView: View {
 
     private func filterChip(_ filter: BuildLogFilter) -> some View {
         let isSelected = store.selectedBuildLogFilterID == filter.id
-        return Button { store.selectBuildLogFilter(filter) } label: {
+        return Button {
+            withAnimation(.smooth(duration: 0.2)) {
+                store.selectBuildLogFilter(filter)
+            }
+        } label: {
             Text(filter.title)
                 .font(.caption2.weight(.medium))
                 .padding(.horizontal, 8)

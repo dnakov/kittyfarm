@@ -13,48 +13,48 @@ struct GRPCTouchInjector {
         let size = try await currentFrameSize()
         let event = makeTouchEvent(from: touch, size: size)
 
-        try await withEmulatorClient { emulator in
-            try await emulator.sendTouch(event)
+        try await withEmulatorClient { emulator, metadata in
+            try await emulator.sendTouch(event, metadata: metadata)
         }
     }
 
     func sendKey(_ keyEvent: DeviceKeyboardEvent) async throws {
-        try await withEmulatorClient { emulator in
+        try await withEmulatorClient { emulator, metadata in
             for modifierKeyCode in keyEvent.modifiers.orderedKeyCodes {
                 var event = Android_Emulation_Control_KeyboardEvent()
                 event.codeType = .mac
                 event.eventType = .keydown
                 event.keyCode = Int32(modifierKeyCode)
-                try await emulator.sendKey(event)
+                try await emulator.sendKey(event, metadata: metadata)
             }
 
             var keyDown = Android_Emulation_Control_KeyboardEvent()
             keyDown.codeType = .mac
             keyDown.eventType = .keydown
             keyDown.keyCode = Int32(keyEvent.keyCode)
-            try await emulator.sendKey(keyDown)
+            try await emulator.sendKey(keyDown, metadata: metadata)
 
             var keyUp = Android_Emulation_Control_KeyboardEvent()
             keyUp.codeType = .mac
             keyUp.eventType = .keyup
             keyUp.keyCode = Int32(keyEvent.keyCode)
-            try await emulator.sendKey(keyUp)
+            try await emulator.sendKey(keyUp, metadata: metadata)
 
             for modifierKeyCode in keyEvent.modifiers.orderedKeyCodes.reversed() {
                 var event = Android_Emulation_Control_KeyboardEvent()
                 event.codeType = .mac
                 event.eventType = .keyup
                 event.keyCode = Int32(modifierKeyCode)
-                try await emulator.sendKey(event)
+                try await emulator.sendKey(event, metadata: metadata)
             }
         }
     }
 
     func setPasteboardText(_ text: String) async throws {
-        try await withEmulatorClient { emulator in
+        try await withEmulatorClient { emulator, metadata in
             var clipData = Android_Emulation_Control_ClipData()
             clipData.text = text
-            try await emulator.setClipboard(clipData)
+            try await emulator.setClipboard(clipData, metadata: metadata)
         }
     }
 
@@ -100,12 +100,13 @@ struct GRPCTouchInjector {
     }
 
     private func withEmulatorClient<Result: Sendable>(
-        _ body: @Sendable (any Android_Emulation_Control_EmulatorController.ClientProtocol) async throws -> Result
+        _ body: @Sendable (any Android_Emulation_Control_EmulatorController.ClientProtocol, GRPCCore.Metadata) async throws -> Result
     ) async throws -> Result {
         guard let grpcPort = descriptor.androidGRPCPort else {
             throw AndroidGRPCError.invalidDescriptor
         }
 
+        let metadata = AndroidEmulatorAuth.metadata(forGRPCPort: grpcPort)
         return try await withGRPCClient(
             transport: .http2NIOPosix(
                 target: .ipv4(address: Self.emulatorGRPCAddress, port: grpcPort),
@@ -113,7 +114,7 @@ struct GRPCTouchInjector {
             )
         ) { client in
             let emulator = Android_Emulation_Control_EmulatorController.Client(wrapping: client)
-            return try await body(emulator)
+            return try await body(emulator, metadata)
         }
     }
 }

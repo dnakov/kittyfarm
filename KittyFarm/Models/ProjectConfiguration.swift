@@ -3,6 +3,7 @@ import Foundation
 struct IOSProjectConfiguration: Codable, Equatable, Sendable {
     var projectPath: String
     var scheme: String
+    var bundleIdentifier: String?
 
     var projectURL: URL {
         URL(fileURLWithPath: projectPath)

@@ -35,9 +35,13 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - path: KittyFarm
+        excludes:
+          - "DevTools/Network/Resources/**"
       - path: Protos
         excludes:
           - "*.proto"
+      - path: KittyFarm/DevTools/Network/Resources/mitmproxy_addon.py
+        buildPhase: resources
     resources:
       - path: KittyFarm/Resources
     dependencies:
@@ -71,3 +75,68 @@ targets:
           if [ ! -f "${SRCROOT}/KittyFarm/Generated/emulator_controller_kittyfarm.pb.swift" ] || [ ! -f "${SRCROOT}/KittyFarm/Generated/emulator_controller_kittyfarm.grpc.swift" ]; then
             echo "warning: Android gRPC stubs are missing. Regenerate them with GeneratedNotice.androidCodegenCommand."
           fi
+      - name: Build and embed KittyProbe
+        script: |
+          set -euo pipefail
+
+          PROBE_SRC="${SRCROOT}/KittyProbe"
+          PROBE_BUILD="/tmp/KittyProbeBuilds"
+          PROBE_DEST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/Resources/KittyProbe"
+
+          if [ ! -d "${PROBE_SRC}/KittyProbe.xcodeproj" ]; then
+            echo "warning: KittyProbe.xcodeproj not found — skipping probe embed. Run 'cd KittyProbe && xcodegen generate' first."
+            exit 0
+          fi
+
+          # Check if products already exist and are fresh.
+          # `find | head -1` would trip `pipefail` when the search root is missing,
+          # so guard with directory existence first.
+          RUNNER_APP=""
+          HOST_APP="${PROBE_BUILD}/Build/Products/Debug-iphonesimulator/KittyProbeApp.app"
+          XCTESTRUN=""
+          if [ -d "${PROBE_BUILD}/Build/Products/Debug-iphonesimulator" ]; then
+            RUNNER_APP=$(find "${PROBE_BUILD}/Build/Products/Debug-iphonesimulator" -maxdepth 1 -name "*-Runner.app" 2>/dev/null | head -1 || true)
+          fi
+          if [ -d "${PROBE_BUILD}" ]; then
+            XCTESTRUN=$(find "${PROBE_BUILD}" -name "*.xctestrun" 2>/dev/null | head -1 || true)
+          fi
+
+          NEEDS_BUILD=0
+          if [ -z "${RUNNER_APP}" ] || [ ! -d "${HOST_APP}" ] || [ -z "${XCTESTRUN}" ]; then
+            NEEDS_BUILD=1
+          else
+            NEWEST_SRC=$(find "${PROBE_SRC}" -name "*.swift" -newer "${RUNNER_APP}" 2>/dev/null | head -1 || true)
+            if [ -n "${NEWEST_SRC}" ]; then
+              NEEDS_BUILD=1
+            fi
+          fi
+
+          if [ "${NEEDS_BUILD}" = "1" ]; then
+            echo "Building KittyProbe for iOS Simulator..."
+            # Clean env to prevent parent xcodebuild vars from polluting the child build
+            env -i HOME="$HOME" PATH="$PATH" \
+              xcodebuild build-for-testing \
+                -project "${PROBE_SRC}/KittyProbe.xcodeproj" \
+                -scheme KittyProbeTests \
+                -destination 'generic/platform=iOS Simulator' \
+                -derivedDataPath "${PROBE_BUILD}" \
+                -quiet 2>&1
+          fi
+
+          # Re-resolve paths after build
+          RUNNER_APP=$(find "${PROBE_BUILD}/Build/Products/Debug-iphonesimulator" -maxdepth 1 -name "*-Runner.app" | head -1)
+          XCTESTRUN=$(find "${PROBE_BUILD}" -name "*.xctestrun" | head -1)
+
+          if [ -z "${RUNNER_APP}" ] || [ ! -d "${HOST_APP}" ] || [ -z "${XCTESTRUN}" ]; then
+            echo "warning: KittyProbe build products not found after build — skipping embed."
+            exit 0
+          fi
+
+          # Copy into app bundle. The .xctestrun references __TESTROOT__/Debug-iphonesimulator/*.app
+          # where __TESTROOT__ is the directory containing the xctestrun file — mirror that layout.
+          mkdir -p "${PROBE_DEST}/Debug-iphonesimulator"
+          rsync -a --delete "${HOST_APP}" "${PROBE_DEST}/Debug-iphonesimulator/"
+          rsync -a --delete "${RUNNER_APP}" "${PROBE_DEST}/Debug-iphonesimulator/"
+          cp -f "${XCTESTRUN}" "${PROBE_DEST}/"
+
+          echo "KittyProbe embedded at ${PROBE_DEST}"

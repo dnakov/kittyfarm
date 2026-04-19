@@ -26,7 +26,7 @@ final class KittyFarmStore {
     var isPresentingDevicePicker = false
     var isPresentingProjectPicker = false
     var isRunningBuildAndPlay = false
-    var isShowingBuildLogs = false
+    var bottomPanel: BottomPanel = .hidden
     var statusMessage = "Add an iOS simulator or Android emulator to begin."
     var deviceBootStates: [String: String] = [:]
     var selectedIOSProject: IOSProjectConfiguration?
@@ -37,17 +37,30 @@ final class KittyFarmStore {
     var buildWarningCount = 0
     var buildErrorCount = 0
 
+    // Testing
+    var testScript: String = UserDefaults.standard.string(forKey: "KittyFarm.testScript") ?? ""
+    var testTargetBundleID: String = UserDefaults.standard.string(forKey: "KittyFarm.testTargetBundleID") ?? ""
+    var isRunningTest = false
+    var testResults: [TestStepResult] = []
+    var testStatusMessage: String?
+
     private let simctlManager = SimctlManager()
     private let emulatorManager = EmulatorManager()
     private let inputCoordinator = InputCoordinator()
     private let runtimeLogManager = RuntimeLogStreamManager()
+    private let devToolsSessions = DevToolsSessionManager()
     private var connections: [String: AnyDeviceConnectionBox] = [:]
+    private let testRunner = TestRunner()
 
     private static let savedDevicesKey = "KittyFarm.savedDevices"
     private static let savedLeaderKey = "KittyFarm.leaderID"
     private static let savedIOSProjectKey = "KittyFarm.selectedIOSProject"
     private static let savedAndroidProjectKey = "KittyFarm.selectedAndroidProject"
     private static let maxBuildLogEntries = 10000
+
+    init() {
+        Task.detached { await ProxyConfigurer.shared.cleanupStale() }
+    }
 
     // MARK: - Discovery
 
@@ -91,6 +104,22 @@ final class KittyFarmStore {
         if let data = defaults.data(forKey: Self.savedIOSProjectKey),
            let project = try? JSONDecoder().decode(IOSProjectConfiguration.self, from: data) {
             selectedIOSProject = project
+
+            // Backfill bundle identifier for projects saved before we started capturing it
+            if project.bundleIdentifier == nil {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let updated = try? await BuildPlayRunner.discoverIOSProject(at: project.projectURL),
+                       updated.bundleIdentifier != nil {
+                        self.selectedIOSProject = IOSProjectConfiguration(
+                            projectPath: project.projectPath,
+                            scheme: project.scheme,
+                            bundleIdentifier: updated.bundleIdentifier
+                        )
+                        self.persistSelectedProjects()
+                    }
+                }
+            }
         }
 
         if let data = defaults.data(forKey: Self.savedAndroidProjectKey),
@@ -138,6 +167,9 @@ final class KittyFarmStore {
             selectedIOSProject = project
             persistSelectedProjects()
             statusMessage = "Selected iOS project \(project.displayName)."
+            for device in activeDevices where device.descriptor.platform == .iOSSimulator {
+                await devToolsSessions.updateBundleID(deviceID: device.id, bundleID: project.bundleIdentifier)
+            }
         } catch {
             statusMessage = "Failed to configure iOS project: \(error.localizedDescription)"
         }
@@ -196,7 +228,64 @@ final class KittyFarmStore {
     }
 
     func toggleBuildLogs() {
-        isShowingBuildLogs.toggle()
+        bottomPanel = (bottomPanel == .logs) ? .hidden : .logs
+    }
+
+    func toggleTestPanel() {
+        bottomPanel = (bottomPanel == .tests) ? .hidden : .tests
+    }
+
+    func showBottomPanel(_ panel: BottomPanel) {
+        bottomPanel = panel
+    }
+
+    // MARK: - Memory Snapshots
+
+    func captureHeapSnapshot(pid: pid_t) async throws -> String {
+        try await devToolsSessions.captureHeap(pid: pid)
+    }
+
+    func captureVMMapSnapshot(pid: pid_t) async throws -> String {
+        try await devToolsSessions.captureVMMap(pid: pid)
+    }
+
+    func captureLeaksSnapshot(pid: pid_t) async throws -> String {
+        try await devToolsSessions.captureLeaks(pid: pid)
+    }
+
+    // MARK: - CPU Deep Sample
+
+    func captureDeepSample(pid: pid_t, durationSec: Int = 10) async throws -> String {
+        try await devToolsSessions.captureDeepSample(pid: pid, durationSec: durationSec)
+    }
+
+    func startDeepSampleRecording(pid: pid_t) async throws -> CPUMonitor.DeepSampleRecording {
+        try await devToolsSessions.startDeepSampleRecording(pid: pid)
+    }
+
+    func stopDeepSampleRecording(_ recording: CPUMonitor.DeepSampleRecording) async throws -> String {
+        try await devToolsSessions.stopDeepSampleRecording(recording)
+    }
+
+    func cancelDeepSampleRecording(_ recording: CPUMonitor.DeepSampleRecording) async {
+        await devToolsSessions.cancelDeepSampleRecording(recording)
+    }
+
+    // MARK: - Time Profiler (xctrace)
+
+    func startXctraceRecording(pid: pid_t, simulatorUDID: String?) async throws -> XctraceRecorder.Session {
+        try await devToolsSessions.startXctraceRecording(pid: pid, simulatorUDID: simulatorUDID)
+    }
+
+    func stopXctraceRecording(
+        _ session: XctraceRecorder.Session,
+        onFlushComplete: (@Sendable () -> Void)? = nil
+    ) async throws -> TimeProfileTrace {
+        try await devToolsSessions.stopXctraceRecording(session, onFlushComplete: onFlushComplete)
+    }
+
+    func cancelXctraceRecording(_ session: XctraceRecorder.Session) async {
+        await devToolsSessions.cancelXctraceRecording(session)
     }
 
     // MARK: - Device Management
@@ -238,10 +327,71 @@ final class KittyFarmStore {
             connections[descriptor.id] = box
             try await box.connect()
             state.noteConnected()
+            await attachDevTools(to: state)
             statusMessage = "Connected \(descriptor.displayName)."
         } catch {
             state.noteError(error)
             statusMessage = "Failed to connect \(descriptor.displayName): \(error.localizedDescription)"
+        }
+    }
+
+    /// Attach DevTools monitors for an iOS device. Starts the network monitor unconditionally
+    /// (needs only UDID) and kicks off the PID poller that auto-attaches memory/CPU monitors
+    /// whenever the target app appears (via Build & Play, Xcode, or any other launch path).
+    /// Re-callable — existing session is torn down and restarted.
+    private func attachDevTools(to state: DeviceState) async {
+        guard case let .iOSSimulator(udid, _, _) = state.descriptor else { return }
+        let bundleID = selectedIOSProject?.bundleIdentifier
+
+        await devToolsSessions.start(
+            deviceID: state.id,
+            udid: udid,
+            bundleID: bundleID,
+            onMemorySample: Self.memorySampleHandler(for: self),
+            onCPUSample: Self.cpuSampleHandler(for: self),
+            onPIDChange: Self.pidChangeHandler(for: self),
+            onNetworkRequest: Self.networkRequestHandler(for: self),
+            onNetworkStatus: Self.networkStatusHandler(for: self)
+        )
+    }
+
+    private static func pidChangeHandler(for store: KittyFarmStore) -> @Sendable (String, pid_t?) -> Void {
+        { [weak store] deviceID, pid in
+            Task { @MainActor [weak store] in
+                store?.activeDevices.first { $0.id == deviceID }?.currentPID = pid
+            }
+        }
+    }
+
+    private static func memorySampleHandler(for store: KittyFarmStore) -> @Sendable (String, MemorySample) -> Void {
+        { [weak store] deviceID, sample in
+            Task { @MainActor [weak store] in
+                store?.activeDevices.first { $0.id == deviceID }?.appendMemorySample(sample)
+            }
+        }
+    }
+
+    private static func cpuSampleHandler(for store: KittyFarmStore) -> @Sendable (String, CPUSample) -> Void {
+        { [weak store] deviceID, sample in
+            Task { @MainActor [weak store] in
+                store?.activeDevices.first { $0.id == deviceID }?.appendCPUSample(sample)
+            }
+        }
+    }
+
+    private static func networkRequestHandler(for store: KittyFarmStore) -> @Sendable (String, NetworkRequest) -> Void {
+        { [weak store] deviceID, request in
+            Task { @MainActor [weak store] in
+                store?.activeDevices.first { $0.id == deviceID }?.appendNetworkRequest(request)
+            }
+        }
+    }
+
+    private static func networkStatusHandler(for store: KittyFarmStore) -> @Sendable (String, NetworkStatus) -> Void {
+        { [weak store] deviceID, status in
+            Task { @MainActor [weak store] in
+                store?.activeDevices.first { $0.id == deviceID }?.updateNetworkStatus(status)
+            }
         }
     }
 
@@ -255,6 +405,7 @@ final class KittyFarmStore {
             activeInputDeviceID = activeDevices.first?.id
         }
         saveDeviceOrder()
+        await devToolsSessions.stop(deviceID: state.id)
         await connection?.disconnect()
     }
 
@@ -278,6 +429,20 @@ final class KittyFarmStore {
         } catch {
             state.noteError(error)
             statusMessage = "Failed to press Home on \(state.descriptor.displayName): \(error.localizedDescription)"
+        }
+    }
+
+    func triggerSimulatorControl(_ control: SimulatorChromeControl, on state: DeviceState) async {
+        guard let connection = connections[state.id] else {
+            return
+        }
+
+        do {
+            try await connection.triggerSimulatorControl(control.id)
+            statusMessage = "Triggered \(control.displayName) on \(state.descriptor.displayName)."
+        } catch {
+            state.noteError(error)
+            statusMessage = "Failed to trigger \(control.displayName) on \(state.descriptor.displayName): \(error.localizedDescription)"
         }
     }
 
@@ -379,10 +544,7 @@ final class KittyFarmStore {
         }
         // Then shut down all simulators system-wide
         do {
-            _ = try await ProcessRunner.run(.init(
-                executableURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
-                arguments: ["simctl", "shutdown", "all"]
-            ))
+            _ = try await ProcessRunner.run(XcrunUtils.simctl(["shutdown", "all"]))
             statusMessage = "All iOS simulators shut down."
         } catch {
             statusMessage = "Failed to shutdown simulators: \(error.localizedDescription)"
@@ -697,7 +859,33 @@ final class KittyFarmStore {
     }
 
     var shouldShowBuildLogs: Bool {
-        isShowingBuildLogs && (!buildLogs.isEmpty || isRunningBuildAndPlay)
+        bottomPanel == .logs && (!buildLogs.isEmpty || isRunningBuildAndPlay)
+    }
+
+    var shouldShowBottomPanel: Bool {
+        bottomPanel != .hidden
+    }
+
+    /// Device targeted by the DevTools bottom-panel tabs.
+    /// Prefers the leader if it's an iOS sim, else the first iOS sim in the grid.
+    /// Returns nil when no iOS sim is active — DevTools panels are iOS-only for now.
+    var focusedIOSDevice: DeviceState? {
+        if let leaderID,
+           let leader = activeDevices.first(where: { $0.id == leaderID }),
+           leader.descriptor.platform == .iOSSimulator {
+            return leader
+        }
+        return activeDevices.first { $0.descriptor.platform == .iOSSimulator }
+    }
+
+    var networkRequestCount: Int {
+        activeDevices.reduce(0) { $0 + $1.networkRequests.count }
+    }
+
+    func clearNetworkRequests() {
+        for device in activeDevices {
+            device.clearNetworkRequests()
+        }
     }
 
     var buildSummaryText: String {
@@ -732,6 +920,110 @@ final class KittyFarmStore {
     func selectBuildLogFilter(_ filter: BuildLogFilter) {
         selectedBuildLogFilterID = filter.id
         rebuildFilteredLogs()
+    }
+
+    // MARK: - DevTools
+
+    func refreshStorage(for state: DeviceState) async {
+        guard state.descriptor.platform == .iOSSimulator,
+              let bundleID = selectedIOSProject?.bundleIdentifier
+        else { return }
+
+        state.isRefreshingStorage = true
+        let snapshot = await devToolsSessions.refreshStorage(deviceID: state.id, bundleID: bundleID)
+        state.storageSnapshot = snapshot
+        state.isRefreshingStorage = false
+    }
+
+    // MARK: - Testing
+
+    func runTestScript() async {
+        guard !isRunningTest, !activeDevices.isEmpty else { return }
+
+        let script: [TestAction]
+        do {
+            script = try TestScriptParser.parse(testScript)
+        } catch {
+            testStatusMessage = error.localizedDescription
+            return
+        }
+
+        guard !script.isEmpty else {
+            testStatusMessage = "Script is empty."
+            return
+        }
+
+        isRunningTest = true
+        testResults = []
+        testStatusMessage = "Running \(script.count) steps..."
+        UserDefaults.standard.set(testScript, forKey: "KittyFarm.testScript")
+        UserDefaults.standard.set(testTargetBundleID, forKey: "KittyFarm.testTargetBundleID")
+
+        // Capture everything needed from @MainActor before entering task group
+        struct DeviceTestContext: Sendable {
+            let connection: AnyDeviceConnectionBox
+            let provider: any AccessibilityTreeProvider
+            let deviceName: String
+        }
+
+        let bundleID = testTargetBundleID.isEmpty ? nil : testTargetBundleID
+        var contexts: [DeviceTestContext] = []
+        for deviceState in activeDevices {
+            guard let connection = connections[deviceState.id] else { continue }
+            let provider = makeTreeProvider(for: deviceState, bundleID: bundleID)
+            contexts.append(DeviceTestContext(
+                connection: connection,
+                provider: provider,
+                deviceName: deviceState.descriptor.displayName
+            ))
+        }
+
+        // Run on all devices in parallel
+        let runner = testRunner
+        let resultCollector = TestResultCollector()
+
+        await withTaskGroup(of: (String, TestRunResult).self) { group in
+            for ctx in contexts {
+                group.addTask {
+                    let result = await runner.run(
+                        script: script,
+                        connection: ctx.connection,
+                        treeProvider: ctx.provider
+                    ) { step in
+                        await resultCollector.append(step)
+                    }
+                    return (ctx.deviceName, result)
+                }
+            }
+
+            for await (deviceName, result) in group {
+                let steps = await resultCollector.drain()
+                testResults.append(contentsOf: steps)
+                if result.passed {
+                    testStatusMessage = "\(deviceName): All \(result.passedCount) steps passed"
+                } else {
+                    testStatusMessage = "\(deviceName): \(result.failedCount) failed, \(result.passedCount) passed"
+                }
+            }
+        }
+
+        isRunningTest = false
+    }
+
+    private func makeTreeProvider(for state: DeviceState, bundleID: String?) -> any AccessibilityTreeProvider {
+        let descriptor = state.descriptor
+        let size = state.currentFrame?.dimensions
+        switch descriptor {
+        case let .iOSSimulator(udid, _, _):
+            let width = Double(size?.width ?? 390)
+            let height = Double(size?.height ?? 844)
+            return IOSAccessibilityProvider(udid: udid, screenWidth: width, screenHeight: height, bundleIdentifier: bundleID)
+
+        case let .androidEmulator(avdName, _):
+            let width = Double(size?.width ?? 1080)
+            let height = Double(size?.height ?? 2400)
+            return LazyAndroidAccessibilityProvider(avdName: avdName, screenWidth: width, screenHeight: height)
+        }
     }
 
     // MARK: - Private
@@ -822,6 +1114,11 @@ final class KittyFarmStore {
 
     private func beginBuildLogSession() {
         selectedBuildLogFilterID = BuildLogFilter.all.id
+
+        // Auto-switch to logs panel when a build starts, unless the user is viewing another panel
+        if bottomPanel == .hidden {
+            bottomPanel = .logs
+        }
 
         if !buildLogs.isEmpty {
             appendBuildLog(String(repeating: "=", count: 48), source: .system)

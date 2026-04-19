@@ -47,7 +47,95 @@ final class AndroidEmulatorConnection: DeviceConnection {
         try await touchInjector.setPasteboardText(text)
     }
 
-    func pressHomeButton() async throws {}
+    func triggerSimulatorControl(_ identifier: String) async throws {}
 
-    func rotateRight() async throws {}
+    func pressHomeButton() async throws {
+        let serial = try await resolveSerial()
+        _ = try await runAdb(["-s", serial, "shell", "input", "keyevent", "3"])
+    }
+
+    func rotateRight() async throws {
+        let serial = try await resolveSerial()
+        // `adb emu rotate` rotates the emulator display 90° clockwise via the
+        // emulator console. Works regardless of per-app orientation locks and
+        // doesn't require disabling auto-rotate or poking system settings.
+        _ = try await runAdb(["-s", serial, "emu", "rotate"])
+    }
+
+    func openApp(_ nameOrBundleID: String) async throws {
+        let serial = try await resolveSerial()
+
+        let packageName = nameOrBundleID.contains(".")
+            ? nameOrBundleID
+            : try await resolveAndroidPackage(name: nameOrBundleID, serial: serial)
+
+        _ = try await runAdb([
+            "-s", serial,
+            "shell", "monkey", "-p", packageName,
+            "-c", "android.intent.category.LAUNCHER", "1"
+        ])
+    }
+
+    private func resolveAndroidPackage(name: String, serial: String) async throws -> String {
+        let stdout = try await runAdb(["-s", serial, "shell", "pm", "list", "packages"])
+        let packages = stdout
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .compactMap { line -> String? in
+                guard line.hasPrefix("package:") else { return nil }
+                return String(line.dropFirst("package:".count))
+            }
+
+        let needle = name.lowercased()
+
+        // Match on the final component first (most specific), then anywhere in the package name.
+        if let exactTail = packages.first(where: { ($0.split(separator: ".").last?.lowercased() ?? "") == needle }) {
+            return exactTail
+        }
+        if let contained = packages.first(where: { $0.lowercased().contains(needle) }) {
+            return contained
+        }
+
+        throw AndroidLaunchError.appNotFound(name)
+    }
+
+    // MARK: - ADB helpers
+
+    private func resolveSerial() async throws -> String {
+        guard case let .androidEmulator(avdName, _) = descriptor else {
+            throw AndroidEmulatorError.notAnAndroidDevice
+        }
+        return try await ADBUtils.resolveSerial(avdName: avdName)
+    }
+
+    @discardableResult
+    private func runAdb(_ arguments: [String]) async throws -> String {
+        let result = try await ProcessRunner.run(.init(
+            executableURL: ADBUtils.binaryURL,
+            arguments: arguments
+        ))
+        try result.requireSuccess("adb \(arguments.dropFirst(2).first ?? "")")
+        return result.stdout
+    }
+}
+
+private enum AndroidEmulatorError: LocalizedError {
+    case notAnAndroidDevice
+
+    var errorDescription: String? {
+        switch self {
+        case .notAnAndroidDevice:
+            return "Descriptor is not an Android emulator."
+        }
+    }
+}
+
+enum AndroidLaunchError: LocalizedError {
+    case appNotFound(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .appNotFound(let name): return "No installed Android package matching \"\(name)\"."
+        }
+    }
 }

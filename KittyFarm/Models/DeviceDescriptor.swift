@@ -71,6 +71,11 @@ enum DeviceDescriptor: Hashable, Identifiable, Sendable {
         return grpcPort
     }
 
+    var iosUDID: String? {
+        guard case let .iOSSimulator(udid, _, _) = self else { return nil }
+        return udid
+    }
+
     var defaultAspectRatio: CGFloat {
         switch self {
         case let .iOSSimulator(_, name, _):

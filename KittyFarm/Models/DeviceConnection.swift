@@ -9,8 +9,10 @@ protocol DeviceConnection: AnyObject {
     func sendKey(_ keyEvent: DeviceKeyboardEvent) async throws
     @MainActor func sendHardwareKeyboardEvent(_ event: NSEvent) async throws
     func setPasteboardText(_ text: String) async throws
+    func triggerSimulatorControl(_ identifier: String) async throws
     func pressHomeButton() async throws
     func rotateRight() async throws
+    func openApp(_ nameOrBundleID: String) async throws
 }
 
 final class AnyDeviceConnectionBox: @unchecked Sendable {
@@ -49,11 +51,19 @@ final class AnyDeviceConnectionBox: @unchecked Sendable {
         try await base.setPasteboardText(text)
     }
 
+    func triggerSimulatorControl(_ identifier: String) async throws {
+        try await base.triggerSimulatorControl(identifier)
+    }
+
     func pressHomeButton() async throws {
         try await base.pressHomeButton()
     }
 
     func rotateRight() async throws {
         try await base.rotateRight()
+    }
+
+    func openApp(_ nameOrBundleID: String) async throws {
+        try await base.openApp(nameOrBundleID)
     }
 }

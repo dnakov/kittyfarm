@@ -10,7 +10,7 @@ struct BuildPlayRunner {
 
     private static var fileManager: FileManager { FileManager.default }
     private static let xcodebuildURL = URL(fileURLWithPath: "/usr/bin/xcodebuild")
-    private static let xcrunURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    private static var xcrunURL: URL { XcrunUtils.xcrunURL }
 
     static func discoverIOSProject(at url: URL) async throws -> IOSProjectConfiguration {
         let projectURL = try resolveIOSProjectContainer(from: url)
@@ -19,7 +19,31 @@ struct BuildPlayRunner {
             throw BuildPlayError.noXcodeScheme(projectURL.lastPathComponent)
         }
 
-        return IOSProjectConfiguration(projectPath: projectURL.path, scheme: scheme)
+        let bundleID = try? await extractIOSBundleID(projectURL: projectURL, scheme: scheme)
+        return IOSProjectConfiguration(projectPath: projectURL.path, scheme: scheme, bundleIdentifier: bundleID)
+    }
+
+    private static func extractIOSBundleID(projectURL: URL, scheme: String) async throws -> String? {
+        var arguments = ["-showBuildSettings", "-scheme", scheme, "-configuration", "Debug"]
+        if projectURL.pathExtension == "xcworkspace" {
+            arguments.insert(contentsOf: ["-workspace", projectURL.path], at: 0)
+        } else {
+            arguments.insert(contentsOf: ["-project", projectURL.path], at: 0)
+        }
+
+        let result = try await ProcessRunner.run(.init(executableURL: xcodebuildURL, arguments: arguments))
+        guard result.terminationStatus == 0 else { return nil }
+
+        for line in result.stdout.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("PRODUCT_BUNDLE_IDENTIFIER =") {
+                let value = trimmed
+                    .replacingOccurrences(of: "PRODUCT_BUNDLE_IDENTIFIER =", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
     }
 
     static func discoverAndroidProject(at url: URL) async throws -> AndroidProjectConfiguration {
@@ -438,17 +462,7 @@ struct BuildPlayRunner {
     }
 
     private static func adbBinaryURL() -> URL {
-        let environment = ProcessInfo.processInfo.environment
-
-        if let sdkRoot = environment["ANDROID_SDK_ROOT"], !sdkRoot.isEmpty {
-            return URL(fileURLWithPath: sdkRoot).appending(path: "platform-tools/adb")
-        }
-
-        if let androidHome = environment["ANDROID_HOME"], !androidHome.isEmpty {
-            return URL(fileURLWithPath: androidHome).appending(path: "platform-tools/adb")
-        }
-
-        return URL(fileURLWithPath: "/Users/sigkitten/Library/Android/sdk/platform-tools/adb")
+        ADBUtils.binaryURL
     }
 
     private static func androidJavaEnvironment() async throws -> [String: String] {

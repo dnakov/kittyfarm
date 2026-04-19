@@ -8,11 +8,13 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 mainContent
 
-                if !store.activeDevices.isEmpty || store.isRunningBuildAndPlay {
-                    Divider()
-                    statusBar
-                }
+                Divider()
+                statusBar
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            .animation(.smooth(duration: 0.35), value: store.shouldShowBottomPanel)
+            .animation(.smooth(duration: 0.25), value: store.activeDevices.isEmpty)
+            .animation(.smooth(duration: 0.25), value: store.isRunningBuildAndPlay)
             .toolbar(removing: .title)
             .toolbar {
                 ToolbarSpacer(.flexible)
@@ -25,7 +27,6 @@ struct ContentView: View {
                     Button("Devices", systemImage: "rectangle.stack.badge.plus") {
                         store.isPresentingDevicePicker = true
                     }
-
                 }
 
                 ToolbarSpacer(.fixed)
@@ -87,14 +88,15 @@ struct ContentView: View {
 
     @ViewBuilder
     private var mainContent: some View {
-        if store.shouldShowBuildLogs {
+        if store.shouldShowBottomPanel {
             VSplitView {
                 DeviceGridView(store: store)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                BuildLogPanelView(store: store)
-                    .frame(minHeight: 180, idealHeight: 240, maxHeight: .infinity)
+                BottomPanelView(store: store)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         } else {
             DeviceGridView(store: store)
         }
@@ -105,6 +107,7 @@ struct ContentView: View {
             if store.isRunningBuildAndPlay {
                 ProgressView()
                     .controlSize(.small)
+                    .transition(.scale.combined(with: .opacity))
             }
 
             Text(store.statusMessage)
@@ -114,16 +117,6 @@ struct ContentView: View {
                 .truncationMode(.tail)
 
             if !store.buildLogs.isEmpty || store.isRunningBuildAndPlay {
-                Label("\(store.buildWarningCount)", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(store.buildWarningCount == 0 ? Color.secondary : Color.yellow)
-                    .fixedSize()
-
-                Label("\(store.buildErrorCount)", systemImage: "xmark.octagon.fill")
-                    .font(.caption)
-                    .foregroundStyle(store.buildErrorCount == 0 ? Color.secondary : Color.red)
-                    .fixedSize()
-
                 Text(store.buildSummaryText)
                     .font(.caption)
                     .foregroundStyle(
@@ -132,22 +125,79 @@ struct ContentView: View {
                             : (store.buildWarningCount > 0 ? Color.yellow : Color.secondary)
                     )
                     .lineLimit(1)
-
-                Spacer(minLength: 0)
-
-                Button(store.shouldShowBuildLogs ? "Hide Logs" : "Show Logs") {
-                    store.toggleBuildLogs()
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
-                .fixedSize()
-            } else {
-                Spacer(minLength: 0)
+                    .contentTransition(.opacity)
             }
+
+            Spacer(minLength: 0)
+
+            openerButton(
+                panel: .logs,
+                title: "Logs",
+                icon: "doc.plaintext",
+                badge: logsBadge
+            )
+
+            openerButton(
+                panel: .tests,
+                title: "Tests",
+                icon: "checklist",
+                badge: testsBadge
+            )
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .glassEffect(.regular, in: .rect(cornerRadius: 0))
+    }
+
+    @ViewBuilder
+    private func openerButton(panel: BottomPanel, title: String, icon: String, badge: (count: Int, color: Color)?) -> some View {
+        let isActive = store.bottomPanel == panel
+        Button {
+            withAnimation(.smooth(duration: 0.35)) {
+                store.bottomPanel = isActive ? .hidden : panel
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.caption)
+                Text(title)
+                    .font(.caption.weight(isActive ? .semibold : .regular))
+                if let badge, badge.count > 0 {
+                    Text("\(badge.count)")
+                        .font(.caption2.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.white)
+                        .contentTransition(.numericText())
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(badge.color, in: .capsule)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .foregroundStyle(isActive ? Color.primary : Color.secondary)
+            .animation(.smooth, value: badge?.count ?? 0)
+        }
+        .buttonStyle(.glass)
+        .controlSize(.small)
+        .fixedSize()
+    }
+
+    private var logsBadge: (count: Int, color: Color)? {
+        if store.buildErrorCount > 0 {
+            return (store.buildErrorCount, .red)
+        }
+        if store.buildWarningCount > 0 {
+            return (store.buildWarningCount, .yellow)
+        }
+        return nil
+    }
+
+    private var testsBadge: (count: Int, color: Color)? {
+        guard !store.testResults.isEmpty else { return nil }
+        let failed = store.testResults.filter { $0.status == .failed }.count
+        if failed > 0 {
+            return (failed, .red)
+        }
+        return (store.testResults.count, .green)
     }
 }
 

@@ -107,16 +107,13 @@ actor RuntimeLogStreamManager {
     private func makeCommand(for target: RuntimeLogTarget) async throws -> ProcessRunner.Command {
         switch target {
         case let .iOSSimulator(udid, processName, _):
-            return .init(
-                executableURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
-                arguments: [
-                    "simctl", "spawn", udid,
-                    "log", "stream",
-                    "--style", "compact",
-                    "--level", "debug",
-                    "--process", processName
-                ]
-            )
+            return XcrunUtils.simctl([
+                "spawn", udid,
+                "log", "stream",
+                "--style", "compact",
+                "--level", "debug",
+                "--process", processName
+            ])
 
         case let .androidEmulator(serial, applicationID, _):
             let adbURL = adbBinaryURL()
@@ -139,17 +136,7 @@ actor RuntimeLogStreamManager {
     }
 
     private func adbBinaryURL() -> URL {
-        let environment = ProcessInfo.processInfo.environment
-
-        if let sdkRoot = environment["ANDROID_SDK_ROOT"], !sdkRoot.isEmpty {
-            return URL(fileURLWithPath: sdkRoot).appending(path: "platform-tools/adb")
-        }
-
-        if let androidHome = environment["ANDROID_HOME"], !androidHome.isEmpty {
-            return URL(fileURLWithPath: androidHome).appending(path: "platform-tools/adb")
-        }
-
-        return URL(fileURLWithPath: "/Users/sigkitten/Library/Android/sdk/platform-tools/adb")
+        ADBUtils.binaryURL
     }
 
     private func shellDescription(for command: ProcessRunner.Command) -> String {

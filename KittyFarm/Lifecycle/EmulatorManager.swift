@@ -144,18 +144,6 @@ actor EmulatorManager {
     }
 
     private var emulatorBinaryURL: URL {
-        if let androidHome = ProcessInfo.processInfo.environment["ANDROID_HOME"] {
-            return URL(fileURLWithPath: androidHome)
-                .appending(path: "emulator")
-                .appending(path: "emulator")
-        }
-
-        if let androidSDKRoot = ProcessInfo.processInfo.environment["ANDROID_SDK_ROOT"] {
-            return URL(fileURLWithPath: androidSDKRoot)
-                .appending(path: "emulator")
-                .appending(path: "emulator")
-        }
-
-        return URL(fileURLWithPath: "/Users/sigkitten/Library/Android/sdk/emulator/emulator")
+        ADBUtils.emulatorBinaryURL
     }
 }
