@@ -23,13 +23,25 @@ KittyFarm is a macOS app that lets you view and control multiple simulators and 
 
 - macOS 26+
 - Xcode 17+
+- Metal Toolchain component for Xcode
 - Android SDK (for emulator support)
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 
 ### Building
 
 The Xcode project is generated from `project.yml` using [XcodeGen](https://github.com/yonaskolb/XcodeGen):
 
+Install the Metal Toolchain once if `xcodebuild` reports `cannot execute tool 'metal' due to missing Metal Toolchain`:
+
 ```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+Generate the main project and the embedded `KittyProbe` helper project before building:
+
+```sh
+cd KittyProbe && xcodegen generate
+cd ..
 xcodegen generate
 xcodebuild -project KittyFarm.xcodeproj -scheme KittyFarm -configuration Debug build
 ```
