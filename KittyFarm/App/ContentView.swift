@@ -18,6 +18,13 @@ struct ContentView: View {
             .animation(.smooth(duration: 0.25), value: store.isRunningBuildAndPlay)
             .toolbar(removing: .title)
             .toolbar {
+                ToolbarItem {
+                    Button("MCP", systemImage: "hammer") {
+                        store.isPresentingMCPDashboard = true
+                    }
+                    .help("MCP Dashboard")
+                }
+
                 ToolbarSpacer(.flexible)
 
                 ToolbarItemGroup {
@@ -107,6 +114,10 @@ struct ContentView: View {
         .sheet(isPresented: $store.isPresentingProjectPicker) {
             ProjectPickerSheet(store: store)
                 .frame(minWidth: 620, minHeight: 420)
+        }
+        .sheet(isPresented: $store.isPresentingMCPDashboard) {
+            MCPDashboardView(store: store)
+                .frame(minWidth: 520, minHeight: 360)
         }
     }
 

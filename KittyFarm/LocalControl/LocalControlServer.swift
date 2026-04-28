@@ -72,6 +72,12 @@ final class LocalControlServer {
         try writeConfig()
     }
 
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        port = 0
+    }
+
     private func handle(_ connection: NWConnection) {
         connection.start(queue: DispatchQueue(label: "KittyFarm.LocalControlConnection"))
         receive(on: connection, buffer: Data())

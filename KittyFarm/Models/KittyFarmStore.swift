@@ -40,6 +40,7 @@ final class KittyFarmStore {
     var syncEnabled = true
     var isPresentingDevicePicker = false
     var isPresentingProjectPicker = false
+    var isPresentingMCPDashboard = false
     var isRunningBuildAndPlay = false
     var bottomPanel: BottomPanel = .hidden
     var statusMessage = "Add an iOS simulator or Android emulator to begin."
@@ -73,6 +74,7 @@ final class KittyFarmStore {
     @ObservationIgnored private var screenRecordingTasks: [String: Task<Void, Never>] = [:]
 
     var localControlStatus: String = "MCP API starting..."
+    var mcpDashboardStatus: String = ""
 
     private static let savedDevicesKey = "KittyFarm.savedDevices"
     private static let savedLeaderKey = "KittyFarm.leaderID"
@@ -94,6 +96,44 @@ final class KittyFarmStore {
             localControlStatus = "MCP listening at 127.0.0.1:\(server.port)/mcp."
         } catch {
             localControlStatus = "MCP API unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    func setLocalControlAPIEnabled(_ isEnabled: Bool) async {
+        if isEnabled {
+            await startLocalControlAPIIfNeeded()
+        } else {
+            localControlServer?.stop()
+            localControlServer = nil
+            localControlStatus = "MCP API off."
+        }
+    }
+
+    var isLocalControlAPIEnabled: Bool {
+        localControlServer != nil
+    }
+
+    var localControlMCPURL: String {
+        guard let server = localControlServer, server.port > 0 else {
+            return "MCP server is off"
+        }
+        return "http://127.0.0.1:\(server.port)/mcp"
+    }
+
+    func installMCPConfiguration(for target: MCPConfigurationTarget) {
+        guard isLocalControlAPIEnabled else {
+            mcpDashboardStatus = "Turn MCP on before adding it to \(target.displayName)."
+            return
+        }
+
+        do {
+            let result = try MCPConfigurationInstaller.install(target: target, mcpURL: localControlMCPURL)
+            mcpDashboardStatus = result.message
+            appendBuildLog("[mcp] \(result.message)", source: .system)
+        } catch {
+            let message = "Could not add KittyFarm to \(target.displayName): \(error.localizedDescription)"
+            mcpDashboardStatus = message
+            appendBuildLog("[mcp] \(message)", source: .system, severity: .error)
         }
     }
 
