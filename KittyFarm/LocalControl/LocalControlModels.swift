@@ -137,6 +137,13 @@ struct LocalControlCrashReportDTO: Codable, Sendable {
     let truncated: Bool
 }
 
+struct LocalControlDocumentationSearchRequest: Codable, Sendable {
+    let query: String
+    let mode: String?
+    let platform: String?
+    let limit: Int?
+}
+
 struct LocalControlScreenRecordingRequest: Codable, Sendable {
     let deviceId: String?
     let deviceIds: [String]?

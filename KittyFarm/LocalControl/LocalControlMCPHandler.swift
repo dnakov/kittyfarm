@@ -99,6 +99,8 @@ enum LocalControlMCPHandler {
         switch name {
         case "kittyfarm_status":
             return try textResult(store.localControlStatusResponse())
+        case "kittyfarm_search_documentation":
+            return try await textResult(store.localControlSearchDocumentation(decode(LocalControlDocumentationSearchRequest.self, from: arguments)))
         case "kittyfarm_list_devices":
             return try textResult(store.localControlDevicesResponse())
         case "kittyfarm_connect_device":
@@ -248,6 +250,7 @@ enum LocalControlMCPHandler {
 
     private static let tools: [[String: Any]] = [
         tool("kittyfarm_status", "KittyFarm Status", "Check high-level KittyFarm app state.", schema()),
+        tool("kittyfarm_search_documentation", "Search Documentation", "Search local Apple SDK symbols and semantic Apple documentation.", documentationSearchSchema()),
         tool("kittyfarm_list_devices", "List KittyFarm Devices", "List available and active devices.", schema()),
         tool("kittyfarm_connect_device", "Connect Device", "Activate and connect a KittyFarm device.", deviceSchema()),
         tool("kittyfarm_disconnect_device", "Disconnect Device", "Remove an active KittyFarm device.", deviceSchema()),
@@ -414,6 +417,31 @@ enum LocalControlMCPHandler {
 
     private static func logsSchema() -> [String: Any] {
         schema(properties: ["limit": ["type": "integer", "minimum": 1, "maximum": 1000]])
+    }
+
+    private static func documentationSearchSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "query": string("Symbol name, framework API, or Apple documentation concept to search for."),
+                "mode": [
+                    "type": "string",
+                    "enum": ["symbols", "docs", "all"],
+                    "description": "Search symbols, semantic docs, or both. Defaults to all.",
+                ],
+                "platform": [
+                    "type": "string",
+                    "enum": ["macos", "ios", "watchos", "all"],
+                    "description": "Optional symbol platform filter. Defaults to all.",
+                ],
+                "limit": [
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 25,
+                    "description": "Maximum results to return. Defaults to 10 and is capped at 25.",
+                ],
+            ],
+            required: ["query"]
+        )
     }
 
     private static func readLogsSchema() -> [String: Any] {
