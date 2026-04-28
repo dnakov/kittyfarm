@@ -180,17 +180,15 @@ final class KittyFarmStore {
            let project = try? JSONDecoder().decode(IOSProjectConfiguration.self, from: data) {
             selectedIOSProject = project
 
-            // Backfill bundle identifier for projects saved before we started capturing it
-            if project.bundleIdentifier == nil {
+            // Backfill bundle identifier and schemes for older saved project configs.
+            if project.bundleIdentifier == nil || project.schemes.isEmpty {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    if let updated = try? await BuildPlayRunner.discoverIOSProject(at: project.projectURL),
-                       updated.bundleIdentifier != nil {
-                        self.selectedIOSProject = IOSProjectConfiguration(
-                            projectPath: project.projectPath,
-                            scheme: project.scheme,
-                            bundleIdentifier: updated.bundleIdentifier
-                        )
+                    if let updated = try? await BuildPlayRunner.discoverIOSProject(
+                        at: project.projectURL,
+                        scheme: project.scheme
+                    ) {
+                        self.selectedIOSProject = updated
                         self.persistSelectedProjects()
                     }
                 }
@@ -236,12 +234,20 @@ final class KittyFarmStore {
         }
     }
 
-    func selectIOSProject(at url: URL) async {
+    func selectIOSProject(at url: URL, scheme: String? = nil) async {
         do {
-            let project = try await BuildPlayRunner.discoverIOSProject(at: url)
+            let trimmedScheme = scheme?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let requestedScheme = trimmedScheme?.isEmpty == false ? trimmedScheme : nil
+            let savedScheme = selectedIOSProject.flatMap { selected -> String? in
+                selected.projectURL.standardizedFileURL == url.standardizedFileURL ? selected.scheme : nil
+            }
+            let project = try await BuildPlayRunner.discoverIOSProject(
+                at: url,
+                scheme: requestedScheme ?? savedScheme
+            )
             selectedIOSProject = project
             persistSelectedProjects()
-            statusMessage = "Selected iOS project \(project.displayName)."
+            statusMessage = "Selected iOS project \(project.displayName) (\(project.scheme))."
             for device in activeDevices where device.descriptor.platform == .iOSSimulator {
                 await devToolsSessions.updateBundleID(deviceID: device.id, bundleID: project.bundleIdentifier)
             }
@@ -256,11 +262,16 @@ final class KittyFarmStore {
         statusMessage = "Cleared the iOS project."
     }
 
-    func updateIOSScheme(_ scheme: String) {
+    func setIOSSchemeText(_ scheme: String) {
         guard var project = selectedIOSProject else { return }
         project.scheme = scheme.trimmingCharacters(in: .whitespacesAndNewlines)
         selectedIOSProject = project
         persistSelectedProjects()
+    }
+
+    func selectIOSScheme(_ scheme: String) async {
+        guard let project = selectedIOSProject else { return }
+        await selectIOSProject(at: project.projectURL, scheme: scheme)
     }
 
     func selectAndroidProject(at url: URL) async {
@@ -1254,7 +1265,7 @@ final class KittyFarmStore {
         }
     }
 
-    private func persistSelectedProjects() {
+    func persistSelectedProjects() {
         let defaults = UserDefaults.standard
 
         if let selectedIOSProject,

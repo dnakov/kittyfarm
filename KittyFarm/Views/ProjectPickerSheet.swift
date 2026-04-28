@@ -16,14 +16,32 @@ struct ProjectPickerSheet: View {
                             .textSelection(.enabled)
                     }
 
-                    TextField(
-                        "Scheme",
-                        text: Binding(
-                            get: { store.selectedIOSProject?.scheme ?? "" },
-                            set: { store.updateIOSScheme($0) }
+                    if let project = store.selectedIOSProject, !project.schemes.isEmpty {
+                        Picker(
+                            "Scheme",
+                            selection: Binding(
+                                get: { store.selectedIOSProject?.scheme ?? project.scheme },
+                                set: { scheme in
+                                    Task { await store.selectIOSScheme(scheme) }
+                                }
+                            )
+                        ) {
+                            ForEach(project.schemes, id: \.self) { scheme in
+                                Text(scheme)
+                                    .tag(scheme)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    } else {
+                        TextField(
+                            "Scheme",
+                            text: Binding(
+                                get: { store.selectedIOSProject?.scheme ?? "" },
+                                set: { store.setIOSSchemeText($0) }
+                            )
                         )
-                    )
-                    .disabled(store.selectedIOSProject == nil)
+                        .disabled(store.selectedIOSProject == nil)
+                    }
 
                     HStack {
                         Button("Choose…") {

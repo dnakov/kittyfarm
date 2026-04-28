@@ -137,6 +137,10 @@ enum LocalControlMCPHandler {
             return try await textResult(store.localControlWaitFor(decode(LocalControlWaitRequest.self, from: arguments)))
         case "kittyfarm_discover_project":
             return try await textResult(store.localControlDiscoverProject(decode(LocalControlDiscoverProjectRequest.self, from: arguments)))
+        case "kittyfarm_list_ios_schemes":
+            return try await textResult(store.localControlListIOSSchemes(decode(LocalControlIOSSchemesRequest.self, from: arguments)))
+        case "kittyfarm_select_ios_project":
+            return try await textResult(store.localControlSelectIOSProject(decode(LocalControlSelectIOSProjectRequest.self, from: arguments)))
         case "kittyfarm_build_and_run":
             return try await textResult(store.localControlBuildAndRun(decode(LocalControlBuildRunRequest.self, from: arguments)))
         case "kittyfarm_get_logs":
@@ -260,7 +264,9 @@ enum LocalControlMCPHandler {
         tool("kittyfarm_assert_not_visible", "Assert Not Visible", "Fail if an accessibility element is visible.", queryDeviceSchema()),
         tool("kittyfarm_wait_for", "Wait For Element", "Wait until an accessibility element appears.", waitSchema()),
         tool("kittyfarm_discover_project", "Discover Project", "Discover iOS and/or Android project settings from a path.", discoverSchema()),
-        tool("kittyfarm_build_and_run", "Build And Run", "Build and launch selected projects on active devices.", buildRunSchema()),
+        tool("kittyfarm_list_ios_schemes", "List iOS Schemes", "List schemes from an Xcode project/workspace path or the currently selected iOS project.", iosSchemesSchema()),
+        tool("kittyfarm_select_ios_project", "Select iOS Project", "Select and persist the iOS project and optional scheme used by Build & Play.", selectIOSProjectSchema()),
+        tool("kittyfarm_build_and_run", "Build And Run", "Build and launch selected projects on active devices, optionally selecting iOS scheme first.", buildRunSchema()),
         tool("kittyfarm_get_logs", "Get Logs", "Return recent KittyFarm build/runtime logs.", logsSchema()),
         tool("kittyfarm_read_logs", "Read Logs", "Read bounded, filtered KittyFarm logs with truncation metadata for MCP diagnostics.", readLogsSchema()),
         tool("kittyfarm_read_crash_reports", "Read Crash Reports", "Read recent bounded macOS DiagnosticReports crash logs for KittyFarm-launched apps.", crashReportsSchema()),
@@ -379,11 +385,29 @@ enum LocalControlMCPHandler {
         schema(
             properties: [
                 "iosProjectPath": string("Optional iOS project directory path."),
+                "iosScheme": string("Optional iOS Xcode scheme. When provided, it is selected and persisted before building."),
                 "androidProjectPath": string("Optional Android project directory path."),
                 "deviceIds": [
                     "type": "array",
                     "items": string("KittyFarm deviceId from kittyfarm_list_devices."),
                 ],
+            ]
+        )
+    }
+
+    private static func iosSchemesSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "path": string("Optional .xcodeproj, .xcworkspace, or containing folder. Omit to use the selected iOS project."),
+            ]
+        )
+    }
+
+    private static func selectIOSProjectSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "path": string("Optional .xcodeproj, .xcworkspace, or containing folder. Omit to change the selected project's scheme."),
+                "scheme": string("Optional Xcode scheme to persist for future Build & Play runs."),
             ]
         )
     }

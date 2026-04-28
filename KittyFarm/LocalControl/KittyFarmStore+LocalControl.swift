@@ -202,12 +202,64 @@ extension KittyFarmStore {
         return LocalControlDiscoverProjectResponse(ios: ios, android: android)
     }
 
+    func localControlListIOSSchemes(_ request: LocalControlIOSSchemesRequest) async throws -> LocalControlIOSSchemesResponse {
+        if let path = request.path?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            let result = try await BuildPlayRunner.discoverIOSSchemes(at: URL(fileURLWithPath: path))
+            let selectedScheme = selectedIOSProject?.projectURL.standardizedFileURL == result.projectURL.standardizedFileURL
+                ? selectedIOSProject?.scheme
+                : nil
+            return LocalControlIOSSchemesResponse(
+                projectPath: result.projectURL.path,
+                selectedScheme: selectedScheme,
+                schemes: result.schemes
+            )
+        }
+
+        guard let project = selectedIOSProject else {
+            throw LocalControlStoreError.invalidRequest("No selected iOS project. Pass path or select a project first.")
+        }
+        let schemes = project.schemes.isEmpty
+            ? (try await BuildPlayRunner.discoverIOSSchemes(at: project.projectURL)).schemes
+            : project.schemes
+        return LocalControlIOSSchemesResponse(
+            projectPath: project.projectPath,
+            selectedScheme: project.scheme,
+            schemes: schemes
+        )
+    }
+
+    func localControlSelectIOSProject(_ request: LocalControlSelectIOSProjectRequest) async throws -> IOSProjectConfiguration {
+        if let path = request.path?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            await selectIOSProject(at: URL(fileURLWithPath: path), scheme: request.scheme)
+        } else if let scheme = request.scheme?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            await selectIOSScheme(scheme)
+        } else {
+            throw LocalControlStoreError.invalidRequest("Select iOS project requires path, scheme, or both.")
+        }
+
+        guard let selectedIOSProject else {
+            throw LocalControlStoreError.invalidRequest("No iOS project selected.")
+        }
+        return selectedIOSProject
+    }
+
     func localControlBuildAndRun(_ request: LocalControlBuildRunRequest) async throws -> LocalControlOKResponse {
         if let path = request.iosProjectPath {
-            selectedIOSProject = try await BuildPlayRunner.discoverIOSProject(at: URL(fileURLWithPath: path))
+            let url = URL(fileURLWithPath: path)
+            let savedScheme = selectedIOSProject?.projectURL.standardizedFileURL == url.standardizedFileURL
+                ? selectedIOSProject?.scheme
+                : nil
+            selectedIOSProject = try await BuildPlayRunner.discoverIOSProject(
+                at: url,
+                scheme: request.iosScheme ?? savedScheme
+            )
+            persistSelectedProjects()
+        } else if let scheme = request.iosScheme?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            await selectIOSScheme(scheme)
         }
         if let path = request.androidProjectPath {
             selectedAndroidProject = try await BuildPlayRunner.discoverAndroidProject(at: URL(fileURLWithPath: path))
+            persistSelectedProjects()
         }
 
         if let ids = request.deviceIds, !ids.isEmpty {

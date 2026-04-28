@@ -244,8 +244,24 @@ struct LocalControlDiscoverProjectResponse: Codable, Sendable {
     let android: AndroidProjectConfiguration?
 }
 
+struct LocalControlIOSSchemesRequest: Codable, Sendable {
+    let path: String?
+}
+
+struct LocalControlIOSSchemesResponse: Codable, Sendable {
+    let projectPath: String
+    let selectedScheme: String?
+    let schemes: [String]
+}
+
+struct LocalControlSelectIOSProjectRequest: Codable, Sendable {
+    let path: String?
+    let scheme: String?
+}
+
 struct LocalControlBuildRunRequest: Codable, Sendable {
     let iosProjectPath: String?
+    let iosScheme: String?
     let androidProjectPath: String?
     let deviceIds: [String]?
 }
