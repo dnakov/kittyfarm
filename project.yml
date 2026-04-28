@@ -61,6 +61,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         OTHER_LDFLAGS:
           - -ObjC
+          - -lsqlite3
     postCompileScripts:
       - name: Validate Android gRPC assets
         script: |
