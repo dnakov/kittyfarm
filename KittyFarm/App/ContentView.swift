@@ -18,7 +18,12 @@ struct ContentView: View {
             .animation(.smooth(duration: 0.25), value: store.isRunningBuildAndPlay)
             .toolbar(removing: .title)
             .toolbar {
-                ToolbarItem {
+                ToolbarItemGroup {
+                    Button("Docs", systemImage: "books.vertical") {
+                        store.isPresentingDocumentationSearch = true
+                    }
+                    .help("Documentation Search")
+
                     Button("MCP", systemImage: "hammer") {
                         store.isPresentingMCPDashboard = true
                     }
@@ -118,6 +123,10 @@ struct ContentView: View {
         .sheet(isPresented: $store.isPresentingMCPDashboard) {
             MCPDashboardView(store: store)
                 .frame(minWidth: 520, minHeight: 360)
+        }
+        .sheet(isPresented: $store.isPresentingDocumentationSearch) {
+            DocumentationSearchView(store: store)
+                .frame(minWidth: 780, minHeight: 540)
         }
     }
 

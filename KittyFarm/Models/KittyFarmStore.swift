@@ -41,6 +41,7 @@ final class KittyFarmStore {
     var isPresentingDevicePicker = false
     var isPresentingProjectPicker = false
     var isPresentingMCPDashboard = false
+    var isPresentingDocumentationSearch = false
     var isRunningBuildAndPlay = false
     var bottomPanel: BottomPanel = .hidden
     var statusMessage = "Add an iOS simulator or Android emulator to begin."
@@ -72,9 +73,13 @@ final class KittyFarmStore {
     @ObservationIgnored private var reportedCrashReportPaths: Set<String> = []
     @ObservationIgnored private var screenRecorders: [String: DeviceScreenRecorder] = [:]
     @ObservationIgnored private var screenRecordingTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored let documentationSearchService: DocumentationSearchService?
 
     var localControlStatus: String = "MCP API starting..."
     var mcpDashboardStatus: String = ""
+    var documentationStatusMessage: String = ""
+    var documentationIndexProgressMessage: String?
+    var isIndexingDocumentation = false
 
     private static let savedDevicesKey = "KittyFarm.savedDevices"
     private static let savedLeaderKey = "KittyFarm.leaderID"
@@ -83,6 +88,7 @@ final class KittyFarmStore {
     private static let maxBuildLogEntries = 10000
 
     init() {
+        documentationSearchService = try? DocumentationSearchService()
         Task.detached { await ProxyConfigurer.shared.cleanupStale() }
     }
 
@@ -1283,7 +1289,7 @@ final class KittyFarmStore {
         }
     }
 
-    private func appendBuildLog(
+    func appendBuildLog(
         _ message: String,
         source: BuildLogSource,
         severity: BuildLogSeverity? = nil
