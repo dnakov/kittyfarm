@@ -12,6 +12,18 @@ enum SemanticDocumentationError: LocalizedError {
     }
 }
 
+protocol SemanticDocumentationServicing: Sendable {
+    func availability() -> SemanticDocumentationService.Availability
+    func search(
+        query: String,
+        frameworks: [String],
+        kinds: [String],
+        limit: Int,
+        omitContent: Bool
+    ) throws -> [SemanticDocumentationResult]
+    func get(identifier: String) throws -> SemanticDocumentationResult
+}
+
 final class SemanticDocumentationService: Sendable {
     struct Availability: Sendable {
         let isAvailable: Bool
@@ -102,3 +114,5 @@ final class SemanticDocumentationService: Sendable {
         return String(cString: pointer)
     }
 }
+
+extension SemanticDocumentationService: SemanticDocumentationServicing {}

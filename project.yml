@@ -141,3 +141,26 @@ targets:
           cp -f "${XCTESTRUN}" "${PROBE_DEST}/"
 
           echo "KittyProbe embedded at ${PROBE_DEST}"
+  KittyFarmTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: KittyFarmTests
+    dependencies:
+      - target: KittyFarm
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sigkitten.kittyfarm.tests
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/KittyFarm.app/Contents/MacOS/KittyFarm"
+schemes:
+  KittyFarm:
+    build:
+      targets:
+        KittyFarm: all
+        KittyFarmTests: [test]
+    test:
+      targets:
+        - KittyFarmTests

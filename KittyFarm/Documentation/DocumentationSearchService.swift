@@ -2,12 +2,12 @@ import Foundation
 
 actor DocumentationSearchService {
     private let store: DocumentationIndexStore
-    private let semanticService: SemanticDocumentationService
+    private let semanticService: any SemanticDocumentationServicing
     private let indexer: DocumentationIndexer
 
     init(
         store: DocumentationIndexStore? = nil,
-        semanticService: SemanticDocumentationService = SemanticDocumentationService()
+        semanticService: any SemanticDocumentationServicing = SemanticDocumentationService()
     ) throws {
         let resolvedStore = try store ?? DocumentationIndexStore()
         self.store = resolvedStore
@@ -52,6 +52,8 @@ actor DocumentationSearchService {
                 let remaining = max(1, request.limit - results.count)
                 let docs = try semanticService.search(
                     query: normalized,
+                    frameworks: [],
+                    kinds: [],
                     limit: request.mode == .all ? remaining : request.limit,
                     omitContent: false
                 )
