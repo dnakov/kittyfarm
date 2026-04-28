@@ -19,4 +19,12 @@ enum XcrunUtils {
             environment: environment ?? ProcessInfo.processInfo.environment
         )
     }
+
+    static var simulatorAppLaunchEnvironment: [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment["SIMCTL_CHILD_NSUnbufferedIO"] = "YES"
+        environment["SIMCTL_CHILD_OS_ACTIVITY_DT_MODE"] = "YES"
+        environment["SIMCTL_CHILD_CFLOG_FORCE_STDERR"] = "YES"
+        return environment
+    }
 }

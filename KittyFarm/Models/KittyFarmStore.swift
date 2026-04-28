@@ -18,13 +18,31 @@ final class KittyFarmStore {
         let errorMessage: String?
     }
 
+    private struct CrashReportWatchTarget: Sendable {
+        let processName: String
+        let deviceLabel: String
+
+        init?(runtimeTarget: RuntimeLogTarget) {
+            switch runtimeTarget {
+            case let .iOSSimulator(udid, processName, deviceLabel):
+                self.processName = processName
+                self.deviceLabel = "\(deviceLabel) (\(String(udid.prefix(8))))"
+            case .androidEmulator:
+                return nil
+            }
+        }
+    }
+
     var availableDevices: [DeviceDescriptor] = []
     var activeDevices: [DeviceState] = []
+    var simulatorPairs: [SimulatorPairInfo] = []
     var leaderID: String?
     var activeInputDeviceID: String?
     var syncEnabled = true
     var isPresentingDevicePicker = false
     var isPresentingProjectPicker = false
+    var isPresentingMCPDashboard = false
+    var isPresentingDocumentationSearch = false
     var isRunningBuildAndPlay = false
     var bottomPanel: BottomPanel = .hidden
     var statusMessage = "Add an iOS simulator or Android emulator to begin."
@@ -49,8 +67,20 @@ final class KittyFarmStore {
     private let inputCoordinator = InputCoordinator()
     private let runtimeLogManager = RuntimeLogStreamManager()
     private let devToolsSessions = DevToolsSessionManager()
-    private var connections: [String: AnyDeviceConnectionBox] = [:]
+    @ObservationIgnored var connections: [String: AnyDeviceConnectionBox] = [:]
     private let testRunner = TestRunner()
+    @ObservationIgnored private var localControlServer: LocalControlServer?
+    @ObservationIgnored private var crashReportMonitorTask: Task<Void, Never>?
+    @ObservationIgnored private var reportedCrashReportPaths: Set<String> = []
+    @ObservationIgnored private var screenRecorders: [String: DeviceScreenRecorder] = [:]
+    @ObservationIgnored private var screenRecordingTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored let documentationSearchService: DocumentationSearchService?
+
+    var localControlStatus: String = "MCP API starting..."
+    var mcpDashboardStatus: String = ""
+    var documentationStatusMessage: String = ""
+    var documentationIndexProgressMessage: String?
+    var isIndexingDocumentation = false
 
     private static let savedDevicesKey = "KittyFarm.savedDevices"
     private static let savedLeaderKey = "KittyFarm.leaderID"
@@ -59,7 +89,59 @@ final class KittyFarmStore {
     private static let maxBuildLogEntries = 10000
 
     init() {
+        documentationSearchService = try? DocumentationSearchService()
         Task.detached { await ProxyConfigurer.shared.cleanupStale() }
+    }
+
+    func startLocalControlAPIIfNeeded() async {
+        guard localControlServer == nil else { return }
+
+        do {
+            let server = try LocalControlServer(store: self)
+            try await server.start()
+            localControlServer = server
+            localControlStatus = "MCP listening at 127.0.0.1:\(server.port)/mcp."
+        } catch {
+            localControlStatus = "MCP API unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    func setLocalControlAPIEnabled(_ isEnabled: Bool) async {
+        if isEnabled {
+            await startLocalControlAPIIfNeeded()
+        } else {
+            localControlServer?.stop()
+            localControlServer = nil
+            localControlStatus = "MCP API off."
+        }
+    }
+
+    var isLocalControlAPIEnabled: Bool {
+        localControlServer != nil
+    }
+
+    var localControlMCPURL: String {
+        guard let server = localControlServer, server.port > 0 else {
+            return "MCP server is off"
+        }
+        return "http://127.0.0.1:\(server.port)/mcp"
+    }
+
+    func installMCPConfiguration(for target: MCPConfigurationTarget) {
+        guard isLocalControlAPIEnabled else {
+            mcpDashboardStatus = "Turn MCP on before adding it to \(target.displayName)."
+            return
+        }
+
+        do {
+            let result = try MCPConfigurationInstaller.install(target: target, mcpURL: localControlMCPURL)
+            mcpDashboardStatus = result.message
+            appendBuildLog("[mcp] \(result.message)", source: .system)
+        } catch {
+            let message = "Could not add KittyFarm to \(target.displayName): \(error.localizedDescription)"
+            mcpDashboardStatus = message
+            appendBuildLog("[mcp] \(message)", source: .system, severity: .error)
+        }
     }
 
     // MARK: - Discovery
@@ -68,9 +150,11 @@ final class KittyFarmStore {
         do {
             async let simulators = simctlManager.listDevices()
             async let emulators = emulatorManager.listAVDs()
+            async let pairs = simctlManager.listDevicePairs()
 
             let simResults = try await simulators
             let emuResults = try await emulators
+            let pairResults = try await pairs
 
             var states: [String: String] = [:]
             var descriptors: [DeviceDescriptor] = []
@@ -89,6 +173,11 @@ final class KittyFarmStore {
                 }
                 return lhs.platform.rawValue < rhs.platform.rawValue
             }
+            let availableSimulatorUDIDs = Set(descriptors.compactMap(\.iosUDID))
+            simulatorPairs = pairResults.filter {
+                availableSimulatorUDIDs.contains($0.watch.udid)
+                    && availableSimulatorUDIDs.contains($0.phone.udid)
+            }
             deviceBootStates = states
             statusMessage = availableDevices.isEmpty ? "No simulators or AVDs were discovered." : "Choose devices to populate the grid."
         } catch {
@@ -105,17 +194,15 @@ final class KittyFarmStore {
            let project = try? JSONDecoder().decode(IOSProjectConfiguration.self, from: data) {
             selectedIOSProject = project
 
-            // Backfill bundle identifier for projects saved before we started capturing it
-            if project.bundleIdentifier == nil {
+            // Backfill bundle identifier and schemes for older saved project configs.
+            if project.bundleIdentifier == nil || project.schemes.isEmpty {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    if let updated = try? await BuildPlayRunner.discoverIOSProject(at: project.projectURL),
-                       updated.bundleIdentifier != nil {
-                        self.selectedIOSProject = IOSProjectConfiguration(
-                            projectPath: project.projectPath,
-                            scheme: project.scheme,
-                            bundleIdentifier: updated.bundleIdentifier
-                        )
+                    if let updated = try? await BuildPlayRunner.discoverIOSProject(
+                        at: project.projectURL,
+                        scheme: project.scheme
+                    ) {
+                        self.selectedIOSProject = updated
                         self.persistSelectedProjects()
                     }
                 }
@@ -161,12 +248,20 @@ final class KittyFarmStore {
         }
     }
 
-    func selectIOSProject(at url: URL) async {
+    func selectIOSProject(at url: URL, scheme: String? = nil) async {
         do {
-            let project = try await BuildPlayRunner.discoverIOSProject(at: url)
+            let trimmedScheme = scheme?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let requestedScheme = trimmedScheme?.isEmpty == false ? trimmedScheme : nil
+            let savedScheme = selectedIOSProject.flatMap { selected -> String? in
+                selected.projectURL.standardizedFileURL == url.standardizedFileURL ? selected.scheme : nil
+            }
+            let project = try await BuildPlayRunner.discoverIOSProject(
+                at: url,
+                scheme: requestedScheme ?? savedScheme
+            )
             selectedIOSProject = project
             persistSelectedProjects()
-            statusMessage = "Selected iOS project \(project.displayName)."
+            statusMessage = "Selected iOS project \(project.displayName) (\(project.scheme))."
             for device in activeDevices where device.descriptor.platform == .iOSSimulator {
                 await devToolsSessions.updateBundleID(deviceID: device.id, bundleID: project.bundleIdentifier)
             }
@@ -181,11 +276,16 @@ final class KittyFarmStore {
         statusMessage = "Cleared the iOS project."
     }
 
-    func updateIOSScheme(_ scheme: String) {
+    func setIOSSchemeText(_ scheme: String) {
         guard var project = selectedIOSProject else { return }
         project.scheme = scheme.trimmingCharacters(in: .whitespacesAndNewlines)
         selectedIOSProject = project
         persistSelectedProjects()
+    }
+
+    func selectIOSScheme(_ scheme: String) async {
+        guard let project = selectedIOSProject else { return }
+        await selectIOSProject(at: project.projectURL, scheme: scheme)
     }
 
     func selectAndroidProject(at url: URL) async {
@@ -397,6 +497,9 @@ final class KittyFarmStore {
 
     func removeDevice(_ state: DeviceState) async {
         let connection = connections.removeValue(forKey: state.id)
+        if state.isScreenRecording {
+            _ = try? await stopScreenRecording(on: state)
+        }
         activeDevices.removeAll { $0.id == state.id }
         if leaderID == state.id {
             leaderID = activeDevices.first?.id
@@ -460,6 +563,121 @@ final class KittyFarmStore {
         }
     }
 
+    func toggleScreenRecording(on state: DeviceState) async {
+        do {
+            if state.isScreenRecording {
+                let result = try await stopScreenRecording(on: state)
+                statusMessage = "Saved \(result.outputURL.lastPathComponent)."
+            } else {
+                let result = try startScreenRecording(on: state)
+                statusMessage = "Recording \(result.deviceName)."
+            }
+        } catch {
+            let message = "Screen recording failed for \(state.descriptor.displayName): \(error.localizedDescription)"
+            statusMessage = message
+            appendBuildLog(message, source: .system, severity: .error)
+        }
+    }
+
+    func toggleAllScreenRecordings() async {
+        let recordingDevices = activeDevices.filter(\.isScreenRecording)
+        if !recordingDevices.isEmpty {
+            var saved = 0
+            for state in recordingDevices {
+                if (try? await stopScreenRecording(on: state)) != nil {
+                    saved += 1
+                }
+            }
+            statusMessage = "Stopped \(saved) screen recording(s)."
+            return
+        }
+
+        var started = 0
+        for state in activeDevices where state.isConnected && state.currentFrame != nil {
+            if (try? startScreenRecording(on: state)) != nil {
+                started += 1
+            }
+        }
+        statusMessage = started == 0 ? "No connected devices have frames to record." : "Recording \(started) device(s)."
+    }
+
+    var isAnyScreenRecording: Bool {
+        activeDevices.contains(where: \.isScreenRecording)
+    }
+
+    @discardableResult
+    func startScreenRecording(on state: DeviceState, fps: Int = 10, maxDurationSeconds: TimeInterval? = nil) throws -> ScreenRecordingResult {
+        if let existing = screenRecorders[state.id] {
+            return activeRecordingResult(existing)
+        }
+
+        guard let frame = state.currentFrame else {
+            throw DeviceScreenRecorderError.missingFrame(state.descriptor.displayName)
+        }
+
+        let outputURL = try makeScreenRecordingURL(for: state)
+        let recorder = try DeviceScreenRecorder(
+            deviceId: state.id,
+            deviceName: state.descriptor.displayName,
+            outputURL: outputURL,
+            frame: frame,
+            fps: fps
+        )
+
+        screenRecorders[state.id] = recorder
+        state.isScreenRecording = true
+        state.screenRecordingStartedAt = recorder.startedAt
+        state.screenRecordingOutputPath = outputURL.path
+        appendBuildLog("[device \(screenRecordingDeviceLabel(for: state))] Started screen recording \(outputURL.lastPathComponent)", source: .system)
+
+        let intervalNanoseconds = UInt64(1_000_000_000 / max(recorder.fps, 1))
+        screenRecordingTasks[state.id]?.cancel()
+        screenRecordingTasks[state.id] = Task { @MainActor [weak self, weak state] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: intervalNanoseconds)
+                guard !Task.isCancelled, let self, let state else { return }
+
+                if let maxDurationSeconds,
+                   Date().timeIntervalSince(recorder.startedAt) >= maxDurationSeconds {
+                    _ = try? await self.stopScreenRecording(on: state)
+                    return
+                }
+
+                guard let latestFrame = state.currentFrame else { continue }
+                do {
+                    try recorder.append(latestFrame)
+                } catch {
+                    let message = "Screen recording failed for \(state.descriptor.displayName): \(error.localizedDescription)"
+                    self.appendBuildLog(message, source: .system, severity: .error)
+                    _ = try? await self.stopScreenRecording(on: state)
+                    return
+                }
+            }
+        }
+
+        return activeRecordingResult(recorder)
+    }
+
+    @discardableResult
+    func stopScreenRecording(on state: DeviceState) async throws -> ScreenRecordingResult {
+        guard let recorder = screenRecorders.removeValue(forKey: state.id) else {
+            throw LocalControlStoreError.invalidRequest("\(state.descriptor.displayName) is not recording.")
+        }
+
+        screenRecordingTasks.removeValue(forKey: state.id)?.cancel()
+        let result = try await recorder.finish()
+
+        state.isScreenRecording = false
+        state.screenRecordingStartedAt = nil
+        state.screenRecordingOutputPath = result.outputURL.path
+
+        appendBuildLog(
+            "[device \(screenRecordingDeviceLabel(for: state))] Saved screen recording \(result.outputURL.path) (\(result.frameCount) frames, \(String(format: "%.1f", result.durationSeconds))s)",
+            source: .system
+        )
+        return result
+    }
+
     func handleHardwareKeyboardEvent(_ event: NSEvent) -> Bool {
         guard let activeInputDeviceID,
               let state = activeDevices.first(where: { $0.id == activeInputDeviceID }),
@@ -500,6 +718,8 @@ final class KittyFarmStore {
     func applySelection(_ selectedIDs: Set<String>) async {
         let currentIDs = Set(activeDevices.map(\.id))
 
+        await pairSelectedAppleSimulatorsIfNeeded(selectedIDs)
+
         let toRemove = activeDevices.filter { !selectedIDs.contains($0.id) }
         for device in toRemove {
             await removeDevice(device)
@@ -515,6 +735,42 @@ final class KittyFarmStore {
         }
 
         isPresentingDevicePicker = false
+    }
+
+    func pairingStatus(for descriptor: DeviceDescriptor) -> String? {
+        guard descriptor.platform == .iOSSimulator else { return nil }
+        if let pair = simulatorPairs.first(where: { $0.includes(descriptor) }),
+           let companion = pair.companionName(for: descriptor) {
+            return "Paired with \(companion)"
+        }
+        if descriptor.isWatchSimulator {
+            return "Unpaired Watch"
+        }
+        return nil
+    }
+
+    private func pairSelectedAppleSimulatorsIfNeeded(_ selectedIDs: Set<String>) async {
+        let selectedDevices = availableDevices.filter { selectedIDs.contains($0.id) }
+        let selectedWatches = selectedDevices.filter(\.isWatchSimulator)
+        guard selectedWatches.count == 1 else { return }
+
+        let selectedPhones = selectedDevices.filter(\.isIPhoneSimulator)
+        guard selectedPhones.count == 1 else { return }
+
+        let watch = selectedWatches[0]
+        let phone = selectedPhones[0]
+        guard let watchUDID = watch.iosUDID, let phoneUDID = phone.iosUDID else { return }
+        if simulatorPairs.contains(where: { $0.watch.udid == watchUDID && $0.phone.udid == phoneUDID }) {
+            return
+        }
+
+        do {
+            let pair = try await simctlManager.ensurePaired(watch: watch, phone: phone)
+            simulatorPairs = try await simctlManager.listDevicePairs()
+            statusMessage = "Paired \(pair.watch.name) with \(pair.phone.name)."
+        } catch {
+            statusMessage = "Failed to pair \(watch.displayName) with \(phone.displayName): \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Reordering
@@ -615,7 +871,7 @@ final class KittyFarmStore {
             return
         }
 
-        let iosDevices = activeDevices.map(\.descriptor).filter { $0.platform == .iOSSimulator }
+        let iosDevices = activeDevices.map(\.descriptor).filter(\.canRunIOSApps)
         let androidDevices = activeDevices.map(\.descriptor).filter { $0.platform == .androidEmulator }
 
         guard !iosDevices.isEmpty || !androidDevices.isEmpty else {
@@ -633,6 +889,7 @@ final class KittyFarmStore {
             return
         }
 
+        let buildStartedAt = Date()
         beginBuildLogSession()
         await runtimeLogManager.stopAll()
         isRunningBuildAndPlay = true
@@ -765,6 +1022,7 @@ final class KittyFarmStore {
             await runtimeLogManager.replaceStreams(for: runtimeTargets) { [weak self] source, message in
                 self?.queueBuildLog(source: source, message: message)
             }
+            startCrashReportMonitoring(for: runtimeTargets, since: buildStartedAt)
         }
     }
 
@@ -772,8 +1030,13 @@ final class KittyFarmStore {
         guard !isRunningBuildAndPlay else { return }
 
         let descriptor = device.descriptor
-        let iosDevices = descriptor.platform == .iOSSimulator ? [descriptor] : []
+        let iosDevices = descriptor.canRunIOSApps ? [descriptor] : []
         let androidDevices = descriptor.platform == .androidEmulator ? [descriptor] : []
+
+        if descriptor.platform == .iOSSimulator, !descriptor.canRunIOSApps {
+            statusMessage = "\(descriptor.displayName) runs \(descriptor.osVersion ?? "a non-iOS runtime") and cannot launch an iOS app target."
+            return
+        }
 
         if !iosDevices.isEmpty, selectedIOSProject == nil {
             statusMessage = "Choose an iOS project before building."
@@ -784,6 +1047,7 @@ final class KittyFarmStore {
             return
         }
 
+        let buildStartedAt = Date()
         beginBuildLogSession()
         isRunningBuildAndPlay = true
         device.isBuildingApp = true
@@ -812,6 +1076,7 @@ final class KittyFarmStore {
                     await runtimeLogManager.replaceStreams(for: result.runtimeTargets) { [weak self] source, message in
                         self?.queueBuildLog(source: source, message: message)
                     }
+                    startCrashReportMonitoring(for: result.runtimeTargets, since: buildStartedAt)
                 }
             } catch {
                 let msg = "iOS failed: \(error.localizedDescription)"
@@ -835,6 +1100,7 @@ final class KittyFarmStore {
                     await runtimeLogManager.replaceStreams(for: result.runtimeTargets) { [weak self] source, message in
                         self?.queueBuildLog(source: source, message: message)
                     }
+                    startCrashReportMonitoring(for: result.runtimeTargets, since: buildStartedAt)
                 }
             } catch {
                 let msg = "Android failed: \(error.localizedDescription)"
@@ -1051,7 +1317,7 @@ final class KittyFarmStore {
         }
     }
 
-    private func persistSelectedProjects() {
+    func persistSelectedProjects() {
         let defaults = UserDefaults.standard
 
         if let selectedIOSProject,
@@ -1069,7 +1335,7 @@ final class KittyFarmStore {
         }
     }
 
-    private func appendBuildLog(
+    func appendBuildLog(
         _ message: String,
         source: BuildLogSource,
         severity: BuildLogSeverity? = nil
@@ -1113,6 +1379,7 @@ final class KittyFarmStore {
     }
 
     private func beginBuildLogSession() {
+        crashReportMonitorTask?.cancel()
         selectedBuildLogFilterID = BuildLogFilter.all.id
 
         // Auto-switch to logs panel when a build starts, unless the user is viewing another panel
@@ -1128,6 +1395,125 @@ final class KittyFarmStore {
         formatter.dateStyle = .none
         formatter.timeStyle = .medium
         appendBuildLog("Starting Build & Play at \(formatter.string(from: Date()))", source: .system)
+    }
+
+    private func startCrashReportMonitoring(for targets: [RuntimeLogTarget], since: Date) {
+        let watchedTargets = targets.compactMap(CrashReportWatchTarget.init(runtimeTarget:))
+        guard !watchedTargets.isEmpty else { return }
+
+        crashReportMonitorTask?.cancel()
+        crashReportMonitorTask = Task { @MainActor [weak self] in
+            for _ in 0..<8 {
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                self?.appendNewCrashReports(for: watchedTargets, since: since)
+            }
+        }
+    }
+
+    private func appendNewCrashReports(for targets: [CrashReportWatchTarget], since: Date) {
+        for target in targets {
+            let request = LocalControlCrashReportsRequest(
+                processName: target.processName,
+                bundleId: nil,
+                search: nil,
+                since: since,
+                limit: 5,
+                maxExcerptLength: 500,
+                includeExcerpt: false
+            )
+
+            guard let response = try? LocalControlCrashReportReader.read(request) else {
+                continue
+            }
+
+            for report in response.reports.reversed() where reportedCrashReportPaths.insert(report.path).inserted {
+                appendBuildLog(crashLogMessage(for: report, target: target), source: .system, severity: .error)
+            }
+        }
+    }
+
+    private func crashLogMessage(for report: LocalControlCrashReportDTO, target: CrashReportWatchTarget) -> String {
+        var parts = ["[device \(target.deviceLabel)] Crash detected"]
+
+        if let processName = report.processName {
+            parts.append(processName)
+        } else {
+            parts.append(target.processName)
+        }
+
+        if let exceptionType = report.exceptionType {
+            parts.append(exceptionType)
+        }
+
+        if let terminationReason = report.terminationReason {
+            parts.append(terminationReason)
+        }
+
+        let appFrame = report.topFrames.first { frame in
+            frame.localizedCaseInsensitiveContains(report.processName ?? target.processName)
+        }
+        if let frame = appFrame ?? report.topFrames.first {
+            parts.append(frame)
+        }
+
+        parts.append(report.fileName)
+        return parts.joined(separator: " • ")
+    }
+
+    func screenRecorder(for deviceId: String) -> DeviceScreenRecorder? {
+        screenRecorders[deviceId]
+    }
+
+    func activeRecordingResult(_ recorder: DeviceScreenRecorder) -> ScreenRecordingResult {
+        ScreenRecordingResult(
+            recordingId: recorder.recordingId,
+            deviceId: recorder.deviceId,
+            deviceName: recorder.deviceName,
+            outputURL: recorder.outputURL,
+            startedAt: recorder.startedAt,
+            finishedAt: Date(),
+            durationSeconds: max(Date().timeIntervalSince(recorder.startedAt), 0),
+            frameCount: recorder.currentFrameCount,
+            width: recorder.width,
+            height: recorder.height,
+            fps: recorder.fps
+        )
+    }
+
+    private func makeScreenRecordingURL(for state: DeviceState) throws -> URL {
+        let directory = FileManager.default
+            .urls(for: .moviesDirectory, in: .userDomainMask)[0]
+            .appending(path: "KittyFarm", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let timestamp = formatter.string(from: Date())
+        let deviceName = sanitizedRecordingComponent(state.descriptor.displayName)
+        return directory.appending(path: "\(deviceName)-\(timestamp).mov")
+    }
+
+    private func sanitizedRecordingComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let scalars = value.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        let collapsed = String(scalars)
+            .split(separator: "-")
+            .joined(separator: "-")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return collapsed.isEmpty ? "device" : collapsed
+    }
+
+    private func screenRecordingDeviceLabel(for state: DeviceState) -> String {
+        switch state.descriptor {
+        case let .iOSSimulator(udid, name, _):
+            return "\(name) (\(String(udid.prefix(8))))"
+        case let .androidEmulator(avdName, _):
+            return avdName
+        }
     }
 
     nonisolated private func queueBuildLog(source: BuildLogSource, message: String) {

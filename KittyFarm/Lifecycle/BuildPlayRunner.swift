@@ -12,15 +12,25 @@ struct BuildPlayRunner {
     private static let xcodebuildURL = URL(fileURLWithPath: "/usr/bin/xcodebuild")
     private static var xcrunURL: URL { XcrunUtils.xcrunURL }
 
-    static func discoverIOSProject(at url: URL) async throws -> IOSProjectConfiguration {
+    static func discoverIOSProject(at url: URL, scheme requestedScheme: String? = nil) async throws -> IOSProjectConfiguration {
         let projectURL = try resolveIOSProjectContainer(from: url)
         let schemes = try await listXcodeSchemes(at: projectURL)
-        guard let scheme = preferredScheme(from: schemes) else {
+        guard let scheme = selectedScheme(from: schemes, requestedScheme: requestedScheme, projectURL: projectURL) else {
             throw BuildPlayError.noXcodeScheme(projectURL.lastPathComponent)
         }
 
         let bundleID = try? await extractIOSBundleID(projectURL: projectURL, scheme: scheme)
-        return IOSProjectConfiguration(projectPath: projectURL.path, scheme: scheme, bundleIdentifier: bundleID)
+        return IOSProjectConfiguration(
+            projectPath: projectURL.path,
+            scheme: scheme,
+            bundleIdentifier: bundleID,
+            schemes: schemes
+        )
+    }
+
+    static func discoverIOSSchemes(at url: URL) async throws -> (projectURL: URL, schemes: [String]) {
+        let projectURL = try resolveIOSProjectContainer(from: url)
+        return (projectURL, try await listXcodeSchemes(at: projectURL))
     }
 
     private static func extractIOSBundleID(projectURL: URL, scheme: String) async throws -> String? {
@@ -122,7 +132,8 @@ struct BuildPlayRunner {
                         ["launch", "--terminate-running-process", udid, bundleID],
                         context: "simctl launch \(bundleID)",
                         logPrefix: devicePrefix,
-                        logger: logger
+                        logger: logger,
+                        environment: XcrunUtils.simulatorAppLaunchEnvironment
                     )
                 }
             }
@@ -211,13 +222,34 @@ struct BuildPlayRunner {
         return response.project?.schemes ?? response.workspace?.schemes ?? []
     }
 
-    private static func preferredScheme(from schemes: [String]) -> String? {
-        schemes.first {
+    private static func preferredScheme(from schemes: [String], projectURL: URL) -> String? {
+        let projectName = projectURL.deletingPathExtension().lastPathComponent
+        if let matchingProjectName = schemes.first(where: { $0.localizedCaseInsensitiveCompare(projectName) == .orderedSame }) {
+            return matchingProjectName
+        }
+
+        return schemes.first {
             let lowered = $0.localizedLowercase
             return !lowered.contains("test")
                 && !lowered.contains("uitest")
                 && !lowered.contains("package")
+                && !lowered.contains("extension")
+                && !lowered.contains("widget")
+                && !lowered.contains("watchkit")
+                && !lowered.contains("watch app")
+                && !lowered.contains("intent")
         } ?? schemes.first
+    }
+
+    private static func selectedScheme(from schemes: [String], requestedScheme: String?, projectURL: URL) -> String? {
+        let requestedScheme = requestedScheme?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let requestedScheme, !requestedScheme.isEmpty else {
+            return preferredScheme(from: schemes, projectURL: projectURL)
+        }
+        if schemes.contains(requestedScheme) {
+            return requestedScheme
+        }
+        return nil
     }
 
     private static func resolveIOSProjectContainer(from url: URL) throws -> URL {
@@ -414,11 +446,13 @@ struct BuildPlayRunner {
         _ arguments: [String],
         context: String,
         logPrefix: String? = nil,
-        logger: Logger?
+        logger: Logger?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) async throws {
         let result = try await runLoggedCommand(.init(
             executableURL: xcrunURL,
-            arguments: ["simctl"] + arguments
+            arguments: ["simctl"] + arguments,
+            environment: environment
         ), context: context, logPrefix: logPrefix, logger: logger)
         try result.requireSuccess(context)
     }

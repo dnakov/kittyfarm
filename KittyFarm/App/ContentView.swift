@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Bindable var store: KittyFarmStore
+    @State private var hoveredToolbarControl: ToolbarControl?
 
     var body: some View {
         NavigationStack {
@@ -17,6 +18,18 @@ struct ContentView: View {
             .animation(.smooth(duration: 0.25), value: store.isRunningBuildAndPlay)
             .toolbar(removing: .title)
             .toolbar {
+                ToolbarItemGroup {
+                    Button("Docs", systemImage: "books.vertical") {
+                        store.isPresentingDocumentationSearch = true
+                    }
+                    .help("Documentation Search")
+
+                    Button("MCP", systemImage: "hammer") {
+                        store.isPresentingMCPDashboard = true
+                    }
+                    .help("MCP Dashboard")
+                }
+
                 ToolbarSpacer(.flexible)
 
                 ToolbarItemGroup {
@@ -43,7 +56,25 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(store.activeDevices.isEmpty)
+                        .onHover { setToolbarHover(.shutdownAll, isHovering: $0) }
                         .help("Shutdown all simulators & emulators")
+
+                        Divider()
+                            .frame(height: 14)
+                            .opacity(0.3)
+
+                        Button {
+                            Task { await store.toggleAllScreenRecordings() }
+                        } label: {
+                            Image(systemName: store.isAnyScreenRecording ? "stop.circle.fill" : "record.circle")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(store.activeDevices.isEmpty ? Color.secondary : (store.isAnyScreenRecording ? Color.red : Color.primary))
+                                .frame(width: 32, height: 24)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(store.activeDevices.isEmpty)
+                        .onHover { setToolbarHover(.screenRecordings, isHovering: $0) }
+                        .help(store.isAnyScreenRecording ? "Stop all screen recordings" : "Record all active devices separately")
 
                         Divider()
                             .frame(height: 14)
@@ -59,11 +90,15 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(store.activeDevices.isEmpty || store.isRunningBuildAndPlay)
+                        .onHover { setToolbarHover(.buildAndPlay, isHovering: $0) }
                         .help(store.isRunningBuildAndPlay ? "Building…" : "Build & Play")
                     }
                     .padding(.horizontal, 4)
                     .padding(.vertical, 4)
                     .glassEffect(.regular, in: .capsule)
+                    .overlay(alignment: .top) {
+                        toolbarHoverBubble
+                    }
                 }
 
             }
@@ -72,6 +107,7 @@ struct ContentView: View {
             HardwareKeyboardCaptureView(store: store)
         }
         .task {
+            await store.startLocalControlAPIIfNeeded()
             store.restoreSavedProjects()
             await store.refreshAvailableDevices()
             await store.restoreSavedDevices()
@@ -83,6 +119,14 @@ struct ContentView: View {
         .sheet(isPresented: $store.isPresentingProjectPicker) {
             ProjectPickerSheet(store: store)
                 .frame(minWidth: 620, minHeight: 420)
+        }
+        .sheet(isPresented: $store.isPresentingMCPDashboard) {
+            MCPDashboardView(store: store)
+                .frame(minWidth: 520, minHeight: 360)
+        }
+        .sheet(isPresented: $store.isPresentingDocumentationSearch) {
+            DocumentationSearchView(store: store)
+                .frame(minWidth: 900, minHeight: 620)
         }
     }
 
@@ -129,6 +173,12 @@ struct ContentView: View {
             }
 
             Spacer(minLength: 0)
+
+            Text(store.localControlStatus)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .help(store.localControlStatus)
 
             openerButton(
                 panel: .logs,
@@ -198,6 +248,48 @@ struct ContentView: View {
             return (failed, .red)
         }
         return (store.testResults.count, .green)
+    }
+
+    @ViewBuilder
+    private var toolbarHoverBubble: some View {
+        if let hoveredToolbarControl {
+            Text(hoveredToolbarControl.title(for: store))
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .glassEffect(.regular, in: .capsule)
+                .offset(y: -34)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .allowsHitTesting(false)
+                .zIndex(10)
+        }
+    }
+
+    private func setToolbarHover(_ control: ToolbarControl, isHovering: Bool) {
+        withAnimation(.smooth(duration: 0.12)) {
+            hoveredToolbarControl = isHovering ? control : (hoveredToolbarControl == control ? nil : hoveredToolbarControl)
+        }
+    }
+}
+
+private enum ToolbarControl: Equatable {
+    case shutdownAll
+    case screenRecordings
+    case buildAndPlay
+
+    @MainActor
+    func title(for store: KittyFarmStore) -> String {
+        switch self {
+        case .shutdownAll:
+            return "Shutdown all devices"
+        case .screenRecordings:
+            return store.isAnyScreenRecording ? "Stop screen recordings" : "Record active devices separately"
+        case .buildAndPlay:
+            return store.isRunningBuildAndPlay ? "Build in progress" : "Build and launch apps"
+        }
     }
 }
 

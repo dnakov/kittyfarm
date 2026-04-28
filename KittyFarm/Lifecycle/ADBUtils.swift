@@ -1,6 +1,13 @@
 import Foundation
 
 enum ADBUtils {
+    private static var defaultSDKRootURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library")
+            .appending(path: "Android")
+            .appending(path: "sdk")
+    }
+
     static var binaryURL: URL {
         let environment = ProcessInfo.processInfo.environment
 
@@ -12,7 +19,7 @@ enum ADBUtils {
             return URL(fileURLWithPath: androidHome).appending(path: "platform-tools/adb")
         }
 
-        return URL(fileURLWithPath: "/Users/sigkitten/Library/Android/sdk/platform-tools/adb")
+        return defaultSDKRootURL.appending(path: "platform-tools/adb")
     }
 
     static var emulatorBinaryURL: URL {
@@ -28,7 +35,9 @@ enum ADBUtils {
                 .appending(path: "emulator")
         }
 
-        return URL(fileURLWithPath: "/Users/sigkitten/Library/Android/sdk/emulator/emulator")
+        return defaultSDKRootURL
+            .appending(path: "emulator")
+            .appending(path: "emulator")
     }
 
     static func resolveSerial(avdName: String) async throws -> String {

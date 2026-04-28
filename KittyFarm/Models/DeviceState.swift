@@ -102,6 +102,9 @@ final class DeviceState {
     var networkRequests: [NetworkRequest] = []
     var networkError: String?
     var networkEnabled: Bool = false
+    var isScreenRecording = false
+    var screenRecordingStartedAt: Date?
+    var screenRecordingOutputPath: String?
 
     private var recentFrameTimes: [CFTimeInterval] = []
 

@@ -140,6 +140,13 @@ struct DevicePickerSheet: View {
                             )
                         }
 
+                        if let pairing = store.pairingStatus(for: device) {
+                            detailPill(
+                                pairing,
+                                color: pairing.hasPrefix("Paired") ? .blue : .secondary
+                            )
+                        }
+
                         detailPill(device.transportDescription)
                     }
                     .font(.caption)
