@@ -146,6 +146,13 @@ enum LocalControlMCPHandler {
             return try textResult(store.localControlReadLogs(decode(LocalControlReadLogsRequest.self, from: arguments)))
         case "kittyfarm_read_crash_reports":
             return try textResult(store.localControlCrashReports(decode(LocalControlCrashReportsRequest.self, from: arguments)))
+        case "kittyfarm_start_screen_recording":
+            return try textResult(store.localControlStartScreenRecording(decode(LocalControlScreenRecordingRequest.self, from: arguments)))
+        case "kittyfarm_stop_screen_recording":
+            let response = try await store.localControlStopScreenRecording(decode(LocalControlScreenRecordingRequest.self, from: arguments))
+            return try textResult(response)
+        case "kittyfarm_screen_recording_status":
+            return try textResult(store.localControlScreenRecordingStatus())
         default:
             throw LocalControlStoreError.invalidRequest("Unknown KittyFarm MCP tool: \(name)")
         }
@@ -257,6 +264,9 @@ enum LocalControlMCPHandler {
         tool("kittyfarm_get_logs", "Get Logs", "Return recent KittyFarm build/runtime logs.", logsSchema()),
         tool("kittyfarm_read_logs", "Read Logs", "Read bounded, filtered KittyFarm logs with truncation metadata for MCP diagnostics.", readLogsSchema()),
         tool("kittyfarm_read_crash_reports", "Read Crash Reports", "Read recent bounded macOS DiagnosticReports crash logs for KittyFarm-launched apps.", crashReportsSchema()),
+        tool("kittyfarm_start_screen_recording", "Start Screen Recording", "Start per-device screen recording from KittyFarm's live device frame feed.", screenRecordingSchema()),
+        tool("kittyfarm_stop_screen_recording", "Stop Screen Recording", "Stop per-device screen recording and return saved .mov paths.", screenRecordingStopSchema()),
+        tool("kittyfarm_screen_recording_status", "Screen Recording Status", "List active KittyFarm screen recordings.", schema()),
     ]
 
     private static func tool(_ name: String, _ title: String, _ description: String, _ inputSchema: [String: Any]) -> [String: Any] {
@@ -440,6 +450,52 @@ enum LocalControlMCPHandler {
                 "includeExcerpt": [
                     "type": "boolean",
                     "description": "Include a bounded report excerpt. Defaults to true.",
+                ],
+            ]
+        )
+    }
+
+    private static func screenRecordingSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "deviceId": string("Optional single KittyFarm deviceId from kittyfarm_list_devices."),
+                "deviceIds": [
+                    "type": "array",
+                    "items": string("KittyFarm deviceId from kittyfarm_list_devices."),
+                    "description": "Optional list of devices to record individually.",
+                ],
+                "allActive": [
+                    "type": "boolean",
+                    "description": "Record every active device into separate .mov files.",
+                ],
+                "fps": [
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "description": "Recording frame rate. Defaults to 10 fps.",
+                ],
+                "maxDurationSeconds": [
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 600,
+                    "description": "Optional auto-stop duration. Defaults to open-ended until stopped.",
+                ],
+            ]
+        )
+    }
+
+    private static func screenRecordingStopSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "deviceId": string("Optional single KittyFarm deviceId from kittyfarm_list_devices."),
+                "deviceIds": [
+                    "type": "array",
+                    "items": string("KittyFarm deviceId from kittyfarm_list_devices."),
+                    "description": "Optional list of devices to stop recording.",
+                ],
+                "allActive": [
+                    "type": "boolean",
+                    "description": "Stop all active screen recordings.",
                 ],
             ]
         )

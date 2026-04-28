@@ -50,6 +50,22 @@ struct ContentView: View {
                             .opacity(0.3)
 
                         Button {
+                            Task { await store.toggleAllScreenRecordings() }
+                        } label: {
+                            Image(systemName: store.isAnyScreenRecording ? "stop.circle.fill" : "record.circle")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(store.activeDevices.isEmpty ? Color.secondary : (store.isAnyScreenRecording ? Color.red : Color.primary))
+                                .frame(width: 32, height: 24)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(store.activeDevices.isEmpty)
+                        .help(store.isAnyScreenRecording ? "Stop all screen recordings" : "Record all active devices separately")
+
+                        Divider()
+                            .frame(height: 14)
+                            .opacity(0.3)
+
+                        Button {
                             Task { await store.buildAndPlay() }
                         } label: {
                             Image(systemName: "play.fill")

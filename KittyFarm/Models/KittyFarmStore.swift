@@ -69,6 +69,8 @@ final class KittyFarmStore {
     @ObservationIgnored private var localControlServer: LocalControlServer?
     @ObservationIgnored private var crashReportMonitorTask: Task<Void, Never>?
     @ObservationIgnored private var reportedCrashReportPaths: Set<String> = []
+    @ObservationIgnored private var screenRecorders: [String: DeviceScreenRecorder] = [:]
+    @ObservationIgnored private var screenRecordingTasks: [String: Task<Void, Never>] = [:]
 
     var localControlStatus: String = "MCP API starting..."
 
@@ -430,6 +432,9 @@ final class KittyFarmStore {
 
     func removeDevice(_ state: DeviceState) async {
         let connection = connections.removeValue(forKey: state.id)
+        if state.isScreenRecording {
+            _ = try? await stopScreenRecording(on: state)
+        }
         activeDevices.removeAll { $0.id == state.id }
         if leaderID == state.id {
             leaderID = activeDevices.first?.id
@@ -491,6 +496,121 @@ final class KittyFarmStore {
             state.noteError(error)
             statusMessage = "Failed to rotate \(state.descriptor.displayName): \(error.localizedDescription)"
         }
+    }
+
+    func toggleScreenRecording(on state: DeviceState) async {
+        do {
+            if state.isScreenRecording {
+                let result = try await stopScreenRecording(on: state)
+                statusMessage = "Saved \(result.outputURL.lastPathComponent)."
+            } else {
+                let result = try startScreenRecording(on: state)
+                statusMessage = "Recording \(result.deviceName)."
+            }
+        } catch {
+            let message = "Screen recording failed for \(state.descriptor.displayName): \(error.localizedDescription)"
+            statusMessage = message
+            appendBuildLog(message, source: .system, severity: .error)
+        }
+    }
+
+    func toggleAllScreenRecordings() async {
+        let recordingDevices = activeDevices.filter(\.isScreenRecording)
+        if !recordingDevices.isEmpty {
+            var saved = 0
+            for state in recordingDevices {
+                if (try? await stopScreenRecording(on: state)) != nil {
+                    saved += 1
+                }
+            }
+            statusMessage = "Stopped \(saved) screen recording(s)."
+            return
+        }
+
+        var started = 0
+        for state in activeDevices where state.isConnected && state.currentFrame != nil {
+            if (try? startScreenRecording(on: state)) != nil {
+                started += 1
+            }
+        }
+        statusMessage = started == 0 ? "No connected devices have frames to record." : "Recording \(started) device(s)."
+    }
+
+    var isAnyScreenRecording: Bool {
+        activeDevices.contains(where: \.isScreenRecording)
+    }
+
+    @discardableResult
+    func startScreenRecording(on state: DeviceState, fps: Int = 10, maxDurationSeconds: TimeInterval? = nil) throws -> ScreenRecordingResult {
+        if let existing = screenRecorders[state.id] {
+            return activeRecordingResult(existing)
+        }
+
+        guard let frame = state.currentFrame else {
+            throw DeviceScreenRecorderError.missingFrame(state.descriptor.displayName)
+        }
+
+        let outputURL = try makeScreenRecordingURL(for: state)
+        let recorder = try DeviceScreenRecorder(
+            deviceId: state.id,
+            deviceName: state.descriptor.displayName,
+            outputURL: outputURL,
+            frame: frame,
+            fps: fps
+        )
+
+        screenRecorders[state.id] = recorder
+        state.isScreenRecording = true
+        state.screenRecordingStartedAt = recorder.startedAt
+        state.screenRecordingOutputPath = outputURL.path
+        appendBuildLog("[device \(screenRecordingDeviceLabel(for: state))] Started screen recording \(outputURL.lastPathComponent)", source: .system)
+
+        let intervalNanoseconds = UInt64(1_000_000_000 / max(recorder.fps, 1))
+        screenRecordingTasks[state.id]?.cancel()
+        screenRecordingTasks[state.id] = Task { @MainActor [weak self, weak state] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: intervalNanoseconds)
+                guard !Task.isCancelled, let self, let state else { return }
+
+                if let maxDurationSeconds,
+                   Date().timeIntervalSince(recorder.startedAt) >= maxDurationSeconds {
+                    _ = try? await self.stopScreenRecording(on: state)
+                    return
+                }
+
+                guard let latestFrame = state.currentFrame else { continue }
+                do {
+                    try recorder.append(latestFrame)
+                } catch {
+                    let message = "Screen recording failed for \(state.descriptor.displayName): \(error.localizedDescription)"
+                    self.appendBuildLog(message, source: .system, severity: .error)
+                    _ = try? await self.stopScreenRecording(on: state)
+                    return
+                }
+            }
+        }
+
+        return activeRecordingResult(recorder)
+    }
+
+    @discardableResult
+    func stopScreenRecording(on state: DeviceState) async throws -> ScreenRecordingResult {
+        guard let recorder = screenRecorders.removeValue(forKey: state.id) else {
+            throw LocalControlStoreError.invalidRequest("\(state.descriptor.displayName) is not recording.")
+        }
+
+        screenRecordingTasks.removeValue(forKey: state.id)?.cancel()
+        let result = try await recorder.finish()
+
+        state.isScreenRecording = false
+        state.screenRecordingStartedAt = nil
+        state.screenRecordingOutputPath = result.outputURL.path
+
+        appendBuildLog(
+            "[device \(screenRecordingDeviceLabel(for: state))] Saved screen recording \(result.outputURL.path) (\(result.frameCount) frames, \(String(format: "%.1f", result.durationSeconds))s)",
+            source: .system
+        )
+        return result
     }
 
     func handleHardwareKeyboardEvent(_ event: NSEvent) -> Bool {
@@ -1237,6 +1357,60 @@ final class KittyFarmStore {
 
         parts.append(report.fileName)
         return parts.joined(separator: " • ")
+    }
+
+    func screenRecorder(for deviceId: String) -> DeviceScreenRecorder? {
+        screenRecorders[deviceId]
+    }
+
+    func activeRecordingResult(_ recorder: DeviceScreenRecorder) -> ScreenRecordingResult {
+        ScreenRecordingResult(
+            recordingId: recorder.recordingId,
+            deviceId: recorder.deviceId,
+            deviceName: recorder.deviceName,
+            outputURL: recorder.outputURL,
+            startedAt: recorder.startedAt,
+            finishedAt: Date(),
+            durationSeconds: max(Date().timeIntervalSince(recorder.startedAt), 0),
+            frameCount: recorder.currentFrameCount,
+            width: recorder.width,
+            height: recorder.height,
+            fps: recorder.fps
+        )
+    }
+
+    private func makeScreenRecordingURL(for state: DeviceState) throws -> URL {
+        let directory = FileManager.default
+            .urls(for: .moviesDirectory, in: .userDomainMask)[0]
+            .appending(path: "KittyFarm", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let timestamp = formatter.string(from: Date())
+        let deviceName = sanitizedRecordingComponent(state.descriptor.displayName)
+        return directory.appending(path: "\(deviceName)-\(timestamp).mov")
+    }
+
+    private func sanitizedRecordingComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let scalars = value.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        let collapsed = String(scalars)
+            .split(separator: "-")
+            .joined(separator: "-")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return collapsed.isEmpty ? "device" : collapsed
+    }
+
+    private func screenRecordingDeviceLabel(for state: DeviceState) -> String {
+        switch state.descriptor {
+        case let .iOSSimulator(udid, name, _):
+            return "\(name) (\(String(udid.prefix(8))))"
+        case let .androidEmulator(avdName, _):
+            return avdName
+        }
     }
 
     nonisolated private func queueBuildLog(source: BuildLogSource, message: String) {

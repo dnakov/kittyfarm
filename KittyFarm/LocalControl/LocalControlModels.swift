@@ -29,6 +29,8 @@ struct LocalControlDeviceDTO: Codable, Sendable {
     let fps: Double
     let latencyMs: Double
     let lastError: String?
+    let isScreenRecording: Bool
+    let screenRecordingOutputPath: String?
 }
 
 struct LocalControlDevicesResponse: Codable, Sendable {
@@ -133,6 +135,34 @@ struct LocalControlCrashReportDTO: Codable, Sendable {
     let topFrames: [String]
     let excerpt: String?
     let truncated: Bool
+}
+
+struct LocalControlScreenRecordingRequest: Codable, Sendable {
+    let deviceId: String?
+    let deviceIds: [String]?
+    let allActive: Bool?
+    let fps: Int?
+    let maxDurationSeconds: Double?
+}
+
+struct LocalControlScreenRecordingResponse: Codable, Sendable {
+    let recordings: [LocalControlScreenRecordingDTO]
+}
+
+struct LocalControlScreenRecordingDTO: Codable, Sendable {
+    let recordingId: String
+    let deviceId: String
+    let deviceName: String
+    let path: String
+    let fileName: String
+    let startedAt: Date
+    let finishedAt: Date?
+    let durationSeconds: Double
+    let frameCount: Int
+    let width: Int
+    let height: Int
+    let fps: Int
+    let isActive: Bool
 }
 
 struct LocalControlConnectRequest: Codable, Sendable {

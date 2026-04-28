@@ -299,6 +299,40 @@ extension KittyFarmStore {
         try LocalControlCrashReportReader.read(request)
     }
 
+    func localControlStartScreenRecording(_ request: LocalControlScreenRecordingRequest) throws -> LocalControlScreenRecordingResponse {
+        let targets = try localControlRecordingTargets(request)
+        let fps = max(1, min(request.fps ?? 10, 30))
+        let maxDurationSeconds = request.maxDurationSeconds.map { max(1, min($0, 600)) }
+        let recordings = try targets.map { state in
+            let result = try startScreenRecording(on: state, fps: fps, maxDurationSeconds: maxDurationSeconds)
+            return localControlScreenRecordingDTO(
+                result,
+                isActive: true
+            )
+        }
+        return LocalControlScreenRecordingResponse(recordings: recordings)
+    }
+
+    func localControlStopScreenRecording(_ request: LocalControlScreenRecordingRequest) async throws -> LocalControlScreenRecordingResponse {
+        let targets = try localControlRecordingTargets(request).filter(\.isScreenRecording)
+        var recordings: [LocalControlScreenRecordingDTO] = []
+        for state in targets {
+            let result = try await stopScreenRecording(on: state)
+            recordings.append(localControlScreenRecordingDTO(result, isActive: false))
+        }
+        return LocalControlScreenRecordingResponse(
+            recordings: recordings.sorted { $0.deviceName.localizedStandardCompare($1.deviceName) == .orderedAscending }
+        )
+    }
+
+    func localControlScreenRecordingStatus() -> LocalControlScreenRecordingResponse {
+        let recordings = activeDevices.compactMap { state -> LocalControlScreenRecordingDTO? in
+            guard state.isScreenRecording, let recorder = screenRecorder(for: state.id) else { return nil }
+            return localControlScreenRecordingDTO(activeRecordingResult(recorder), isActive: true)
+        }
+        return LocalControlScreenRecordingResponse(recordings: recordings)
+    }
+
     private func localControlDeviceDTO(
         descriptor: DeviceDescriptor,
         state: DeviceState?,
@@ -317,8 +351,54 @@ extension KittyFarmStore {
             frameHeight: dimensions?.height,
             fps: state?.fps ?? 0,
             latencyMs: state?.latencyMs ?? 0,
-            lastError: state?.lastError
+            lastError: state?.lastError,
+            isScreenRecording: state?.isScreenRecording ?? false,
+            screenRecordingOutputPath: state?.screenRecordingOutputPath
         )
+    }
+
+    private func localControlScreenRecordingDTO(_ result: ScreenRecordingResult, isActive: Bool) -> LocalControlScreenRecordingDTO {
+        LocalControlScreenRecordingDTO(
+            recordingId: result.recordingId,
+            deviceId: result.deviceId,
+            deviceName: result.deviceName,
+            path: result.outputURL.path,
+            fileName: result.outputURL.lastPathComponent,
+            startedAt: result.startedAt,
+            finishedAt: isActive ? nil : result.finishedAt,
+            durationSeconds: result.durationSeconds,
+            frameCount: result.frameCount,
+            width: result.width,
+            height: result.height,
+            fps: result.fps,
+            isActive: isActive
+        )
+    }
+
+    private func localControlRecordingTargets(_ request: LocalControlScreenRecordingRequest) throws -> [DeviceState] {
+        if request.allActive == true {
+            return activeDevices
+        }
+
+        var ids: [String] = []
+        if let deviceId = request.deviceId {
+            ids.append(deviceId)
+        }
+        if let deviceIds = request.deviceIds {
+            ids.append(contentsOf: deviceIds)
+        }
+
+        guard !ids.isEmpty else {
+            throw LocalControlStoreError.invalidRequest("Screen recording requires deviceId, deviceIds, or allActive=true.")
+        }
+
+        let statesByID = Dictionary(uniqueKeysWithValues: activeDevices.map { ($0.id, $0) })
+        return try ids.uniqued().map { id in
+            guard let state = statesByID[id] else {
+                throw LocalControlStoreError.deviceNotFound(id)
+            }
+            return state
+        }
     }
 
     private func localControlLogDTO(_ entry: BuildLogEntry, message: String? = nil) -> LocalControlLogDTO {
@@ -475,5 +555,12 @@ private extension Duration {
 private extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
+    }
+}
+
+private extension Array where Element: Hashable {
+    func uniqued() -> [Element] {
+        var seen: Set<Element> = []
+        return filter { seen.insert($0).inserted }
     }
 }

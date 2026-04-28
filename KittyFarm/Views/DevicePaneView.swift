@@ -118,6 +118,17 @@ struct DevicePaneView: View {
             .help("Rotate Right")
 
             Button {
+                Task { await store.toggleScreenRecording(on: state) }
+            } label: {
+                Image(systemName: state.isScreenRecording ? "stop.circle.fill" : "record.circle")
+                    .foregroundStyle(state.isScreenRecording ? Color.red : Color.primary)
+            }
+            .buttonStyle(.glass)
+            .controlSize(.small)
+            .disabled(!state.isConnected || state.currentFrame == nil)
+            .help(state.isScreenRecording ? "Stop screen recording" : "Record this device")
+
+            Button {
                 Task { await store.buildAndPlay(for: state) }
             } label: {
                 Image(systemName: "play.fill")
@@ -272,6 +283,13 @@ struct DevicePaneView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
+                }
+
+                if state.isScreenRecording {
+                    Label("REC", systemImage: "record.circle.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
                 }
             }
             .fixedSize(horizontal: false, vertical: true)
