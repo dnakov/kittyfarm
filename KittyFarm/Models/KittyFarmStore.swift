@@ -72,7 +72,7 @@ final class KittyFarmStore {
             let server = try LocalControlServer(store: self)
             try await server.start()
             localControlServer = server
-            localControlStatus = "MCP API listening on 127.0.0.1:\(server.port)."
+            localControlStatus = "MCP listening at 127.0.0.1:\(server.port)/mcp."
         } catch {
             localControlStatus = "MCP API unavailable: \(error.localizedDescription)"
         }

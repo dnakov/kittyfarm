@@ -1,6 +1,5 @@
 import Foundation
 import Network
-import Darwin
 
 enum LocalControlServerError: LocalizedError {
     case missingRequest
@@ -27,6 +26,8 @@ enum LocalControlServerError: LocalizedError {
 
 @MainActor
 final class LocalControlServer {
+    static let defaultPort: UInt16 = 47892
+
     private let store: KittyFarmStore
     private let token: String
     private let configURL: URL
@@ -51,8 +52,7 @@ final class LocalControlServer {
     func start() async throws {
         guard listener == nil else { return }
 
-        let localPort = try Self.reserveLocalPort()
-        guard let nwPort = NWEndpoint.Port(rawValue: localPort) else {
+        guard let nwPort = NWEndpoint.Port(rawValue: Self.defaultPort) else {
             throw LocalControlServerError.portAllocationFailed
         }
 
@@ -67,7 +67,7 @@ final class LocalControlServer {
         }
         listener.start(queue: DispatchQueue(label: "KittyFarm.LocalControlServer"))
 
-        port = localPort
+        port = Self.defaultPort
         self.listener = listener
         try writeConfig()
     }
@@ -112,6 +112,18 @@ final class LocalControlServer {
     }
 
     private func respond(to request: HTTPRequest, on connection: NWConnection) async {
+        if request.path == "/mcp" {
+            let response = await LocalControlMCPHandler.respond(to: request.body, store: store)
+            send(
+                body: response.body,
+                status: response.status,
+                contentType: response.contentType,
+                headers: response.headers,
+                on: connection
+            )
+            return
+        }
+
         do {
             guard request.bearerToken == token else {
                 throw LocalControlServerError.unauthorized
@@ -198,11 +210,31 @@ final class LocalControlServer {
         send(body: body, status: status, contentType: "application/json", on: connection)
     }
 
-    private func send(body: Data, status: Int, contentType: String, on connection: NWConnection) {
-        let reason = status == 200 ? "OK" : "Error"
+    private func send(
+        body: Data,
+        status: Int,
+        contentType: String,
+        headers: [String: String] = [:],
+        on connection: NWConnection
+    ) {
+        let reason: String
+        switch status {
+        case 200: reason = "OK"
+        case 202: reason = "Accepted"
+        case 204: reason = "No Content"
+        case 400: reason = "Bad Request"
+        case 401: reason = "Unauthorized"
+        case 404: reason = "Not Found"
+        case 405: reason = "Method Not Allowed"
+        case 500: reason = "Internal Server Error"
+        default: reason = "Response"
+        }
         var response = Data("HTTP/1.1 \(status) \(reason)\r\n".utf8)
         response.append(Data("Content-Type: \(contentType)\r\n".utf8))
         response.append(Data("Content-Length: \(body.count)\r\n".utf8))
+        for (name, value) in headers {
+            response.append(Data("\(name): \(value)\r\n".utf8))
+        }
         response.append(Data("Connection: close\r\n\r\n".utf8))
         response.append(body)
         connection.send(content: response, completion: .contentProcessed { _ in
@@ -211,7 +243,8 @@ final class LocalControlServer {
     }
 
     private func writeConfig() throws {
-        let config = LocalControlConfig(baseURL: "http://127.0.0.1:\(port)", token: token)
+        let baseURL = "http://127.0.0.1:\(port)"
+        let config = LocalControlConfig(baseURL: baseURL, mcpURL: "\(baseURL)/mcp", token: token)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(config).write(to: configURL, options: .atomic)
@@ -222,42 +255,6 @@ final class LocalControlServer {
             .appending(path: "KittyFarm")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
-    }
-
-    private static func reserveLocalPort() throws -> UInt16 {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else {
-            throw LocalControlServerError.portAllocationFailed
-        }
-        defer { close(fd) }
-
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = 0
-        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-
-        let bindResult = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                bind(fd, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            throw LocalControlServerError.portAllocationFailed
-        }
-
-        var boundAddress = sockaddr_in()
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                getsockname(fd, socketAddress, &length)
-            }
-        }
-        guard nameResult == 0 else {
-            throw LocalControlServerError.portAllocationFailed
-        }
-
-        return UInt16(bigEndian: boundAddress.sin_port)
     }
 }
 

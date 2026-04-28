@@ -2,6 +2,7 @@ import Foundation
 
 struct LocalControlConfig: Codable, Sendable {
     let baseURL: String
+    let mcpURL: String
     let token: String
 }
 
@@ -63,6 +64,11 @@ struct LocalControlConnectRequest: Codable, Sendable {
 
 struct LocalControlDeviceRequest: Codable, Sendable {
     let deviceId: String
+}
+
+struct LocalControlAccessibilityRequest: Codable, Sendable {
+    let deviceId: String
+    let bundleId: String?
 }
 
 struct LocalControlTapRequest: Codable, Sendable {
