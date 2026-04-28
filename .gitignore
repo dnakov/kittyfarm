@@ -29,3 +29,7 @@ Pods/
 *.swp
 *.swo
 *~
+
+# Node sidecars
+node_modules/
+mcp/dist/

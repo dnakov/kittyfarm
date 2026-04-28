@@ -72,6 +72,7 @@ struct ContentView: View {
             HardwareKeyboardCaptureView(store: store)
         }
         .task {
+            await store.startLocalControlAPIIfNeeded()
             store.restoreSavedProjects()
             await store.refreshAvailableDevices()
             await store.restoreSavedDevices()
@@ -129,6 +130,12 @@ struct ContentView: View {
             }
 
             Spacer(minLength: 0)
+
+            Text(store.localControlStatus)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .help(store.localControlStatus)
 
             openerButton(
                 panel: .logs,

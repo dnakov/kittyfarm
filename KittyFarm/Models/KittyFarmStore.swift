@@ -49,8 +49,11 @@ final class KittyFarmStore {
     private let inputCoordinator = InputCoordinator()
     private let runtimeLogManager = RuntimeLogStreamManager()
     private let devToolsSessions = DevToolsSessionManager()
-    private var connections: [String: AnyDeviceConnectionBox] = [:]
+    @ObservationIgnored var connections: [String: AnyDeviceConnectionBox] = [:]
     private let testRunner = TestRunner()
+    @ObservationIgnored private var localControlServer: LocalControlServer?
+
+    var localControlStatus: String = "MCP API starting..."
 
     private static let savedDevicesKey = "KittyFarm.savedDevices"
     private static let savedLeaderKey = "KittyFarm.leaderID"
@@ -60,6 +63,19 @@ final class KittyFarmStore {
 
     init() {
         Task.detached { await ProxyConfigurer.shared.cleanupStale() }
+    }
+
+    func startLocalControlAPIIfNeeded() async {
+        guard localControlServer == nil else { return }
+
+        do {
+            let server = try LocalControlServer(store: self)
+            try await server.start()
+            localControlServer = server
+            localControlStatus = "MCP API listening on 127.0.0.1:\(server.port)."
+        } catch {
+            localControlStatus = "MCP API unavailable: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Discovery
