@@ -252,24 +252,24 @@ private struct LogTextView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = context.coordinator.textView else { return }
 
-        let previousCount = context.coordinator.lastEntryCount
-        let newCount = entries.count
+        let previousIDs = context.coordinator.lastEntryIDs
+        let newIDs = entries.map(\.id)
 
-        if newCount == 0 {
+        if newIDs.isEmpty {
             textView.textStorage?.setAttributedString(NSAttributedString())
-            context.coordinator.lastEntryCount = 0
+            context.coordinator.lastEntryIDs = []
             return
         }
 
-        if newCount < previousCount {
-            textView.textStorage?.setAttributedString(buildAttributedString(from: entries))
-        } else if newCount > previousCount {
-            let newEntries = Array(entries[previousCount...])
-            let appended = buildAttributedString(from: newEntries, startWithNewline: previousCount > 0)
+        if newIDs.count > previousIDs.count && Array(newIDs.prefix(previousIDs.count)) == previousIDs {
+            let newEntries = Array(entries[previousIDs.count...])
+            let appended = buildAttributedString(from: newEntries, startWithNewline: !previousIDs.isEmpty)
             textView.textStorage?.append(appended)
+        } else if newIDs != previousIDs {
+            textView.textStorage?.setAttributedString(buildAttributedString(from: entries))
         }
 
-        context.coordinator.lastEntryCount = newCount
+        context.coordinator.lastEntryIDs = newIDs
 
         if autoScroll {
             textView.scrollToEndOfDocument(nil)
@@ -280,7 +280,7 @@ private struct LogTextView: NSViewRepresentable {
 
     final class Coordinator {
         var textView: NSTextView?
-        var lastEntryCount = 0
+        var lastEntryIDs: [UUID] = []
     }
 
     private func buildAttributedString(from entries: [BuildLogEntry], startWithNewline: Bool = false) -> NSMutableAttributedString {

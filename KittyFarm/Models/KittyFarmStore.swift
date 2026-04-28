@@ -18,6 +18,21 @@ final class KittyFarmStore {
         let errorMessage: String?
     }
 
+    private struct CrashReportWatchTarget: Sendable {
+        let processName: String
+        let deviceLabel: String
+
+        init?(runtimeTarget: RuntimeLogTarget) {
+            switch runtimeTarget {
+            case let .iOSSimulator(udid, processName, deviceLabel):
+                self.processName = processName
+                self.deviceLabel = "\(deviceLabel) (\(String(udid.prefix(8))))"
+            case .androidEmulator:
+                return nil
+            }
+        }
+    }
+
     var availableDevices: [DeviceDescriptor] = []
     var activeDevices: [DeviceState] = []
     var leaderID: String?
@@ -52,6 +67,8 @@ final class KittyFarmStore {
     @ObservationIgnored var connections: [String: AnyDeviceConnectionBox] = [:]
     private let testRunner = TestRunner()
     @ObservationIgnored private var localControlServer: LocalControlServer?
+    @ObservationIgnored private var crashReportMonitorTask: Task<Void, Never>?
+    @ObservationIgnored private var reportedCrashReportPaths: Set<String> = []
 
     var localControlStatus: String = "MCP API starting..."
 
@@ -649,6 +666,7 @@ final class KittyFarmStore {
             return
         }
 
+        let buildStartedAt = Date()
         beginBuildLogSession()
         await runtimeLogManager.stopAll()
         isRunningBuildAndPlay = true
@@ -781,6 +799,7 @@ final class KittyFarmStore {
             await runtimeLogManager.replaceStreams(for: runtimeTargets) { [weak self] source, message in
                 self?.queueBuildLog(source: source, message: message)
             }
+            startCrashReportMonitoring(for: runtimeTargets, since: buildStartedAt)
         }
     }
 
@@ -805,6 +824,7 @@ final class KittyFarmStore {
             return
         }
 
+        let buildStartedAt = Date()
         beginBuildLogSession()
         isRunningBuildAndPlay = true
         device.isBuildingApp = true
@@ -833,6 +853,7 @@ final class KittyFarmStore {
                     await runtimeLogManager.replaceStreams(for: result.runtimeTargets) { [weak self] source, message in
                         self?.queueBuildLog(source: source, message: message)
                     }
+                    startCrashReportMonitoring(for: result.runtimeTargets, since: buildStartedAt)
                 }
             } catch {
                 let msg = "iOS failed: \(error.localizedDescription)"
@@ -856,6 +877,7 @@ final class KittyFarmStore {
                     await runtimeLogManager.replaceStreams(for: result.runtimeTargets) { [weak self] source, message in
                         self?.queueBuildLog(source: source, message: message)
                     }
+                    startCrashReportMonitoring(for: result.runtimeTargets, since: buildStartedAt)
                 }
             } catch {
                 let msg = "Android failed: \(error.localizedDescription)"
@@ -1134,6 +1156,7 @@ final class KittyFarmStore {
     }
 
     private func beginBuildLogSession() {
+        crashReportMonitorTask?.cancel()
         selectedBuildLogFilterID = BuildLogFilter.all.id
 
         // Auto-switch to logs panel when a build starts, unless the user is viewing another panel
@@ -1149,6 +1172,71 @@ final class KittyFarmStore {
         formatter.dateStyle = .none
         formatter.timeStyle = .medium
         appendBuildLog("Starting Build & Play at \(formatter.string(from: Date()))", source: .system)
+    }
+
+    private func startCrashReportMonitoring(for targets: [RuntimeLogTarget], since: Date) {
+        let watchedTargets = targets.compactMap(CrashReportWatchTarget.init(runtimeTarget:))
+        guard !watchedTargets.isEmpty else { return }
+
+        crashReportMonitorTask?.cancel()
+        crashReportMonitorTask = Task { @MainActor [weak self] in
+            for _ in 0..<8 {
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                self?.appendNewCrashReports(for: watchedTargets, since: since)
+            }
+        }
+    }
+
+    private func appendNewCrashReports(for targets: [CrashReportWatchTarget], since: Date) {
+        for target in targets {
+            let request = LocalControlCrashReportsRequest(
+                processName: target.processName,
+                bundleId: nil,
+                search: nil,
+                since: since,
+                limit: 5,
+                maxExcerptLength: 500,
+                includeExcerpt: false
+            )
+
+            guard let response = try? LocalControlCrashReportReader.read(request) else {
+                continue
+            }
+
+            for report in response.reports.reversed() where reportedCrashReportPaths.insert(report.path).inserted {
+                appendBuildLog(crashLogMessage(for: report, target: target), source: .system, severity: .error)
+            }
+        }
+    }
+
+    private func crashLogMessage(for report: LocalControlCrashReportDTO, target: CrashReportWatchTarget) -> String {
+        var parts = ["[device \(target.deviceLabel)] Crash detected"]
+
+        if let processName = report.processName {
+            parts.append(processName)
+        } else {
+            parts.append(target.processName)
+        }
+
+        if let exceptionType = report.exceptionType {
+            parts.append(exceptionType)
+        }
+
+        if let terminationReason = report.terminationReason {
+            parts.append(terminationReason)
+        }
+
+        let appFrame = report.topFrames.first { frame in
+            frame.localizedCaseInsensitiveContains(report.processName ?? target.processName)
+        }
+        if let frame = appFrame ?? report.topFrames.first {
+            parts.append(frame)
+        }
+
+        parts.append(report.fileName)
+        return parts.joined(separator: " • ")
     }
 
     nonisolated private func queueBuildLog(source: BuildLogSource, message: String) {
