@@ -240,6 +240,65 @@ extension KittyFarmStore {
         })
     }
 
+    func localControlReadLogs(_ request: LocalControlReadLogsRequest) throws -> LocalControlReadLogsResponse {
+        let limit = max(1, min(request.limit ?? 50, 200))
+        let maxMessageLength = max(120, min(request.maxMessageLength ?? 600, 2_000))
+        let minimumSeverity = try parseSeverity(request.minimumSeverity ?? "info")
+        let source = try parseSource(request.source)
+        let normalizedSearch = request.search?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let normalizedScope = request.scope?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let newestFirst = request.newestFirst ?? false
+
+        let matched = buildLogs.filter { entry in
+            guard entry.severity.rank >= minimumSeverity.rank else { return false }
+            if let source, entry.source != source { return false }
+            if let normalizedScope, entry.scope.id != normalizedScope { return false }
+            if let since = request.since, entry.timestamp < since { return false }
+            if let normalizedSearch,
+               entry.message.range(of: normalizedSearch, options: [.caseInsensitive, .diacriticInsensitive]) == nil {
+                return false
+            }
+            return true
+        }
+
+        var selected = Array(matched.suffix(limit))
+        if newestFirst {
+            selected.reverse()
+        }
+
+        var truncatedCount = 0
+        let logs = selected.map { entry in
+            let message = truncate(entry.message, maxLength: maxMessageLength)
+            if message != entry.message {
+                truncatedCount += 1
+            }
+            return localControlLogDTO(entry, message: message)
+        }
+
+        return LocalControlReadLogsResponse(
+            totalAvailable: buildLogs.count,
+            matchedCount: matched.count,
+            returnedCount: logs.count,
+            omittedCount: max(matched.count - logs.count, 0),
+            truncatedMessageCount: truncatedCount,
+            limit: limit,
+            maxMessageLength: maxMessageLength,
+            filters: LocalControlLogFilters(
+                minimumSeverity: minimumSeverity.rawValue,
+                source: source?.rawValue,
+                scope: normalizedScope,
+                search: normalizedSearch,
+                since: request.since,
+                newestFirst: newestFirst
+            ),
+            logs: logs
+        )
+    }
+
+    func localControlCrashReports(_ request: LocalControlCrashReportsRequest) throws -> LocalControlCrashReportsResponse {
+        try LocalControlCrashReportReader.read(request)
+    }
+
     private func localControlDeviceDTO(
         descriptor: DeviceDescriptor,
         state: DeviceState?,
@@ -260,6 +319,43 @@ extension KittyFarmStore {
             latencyMs: state?.latencyMs ?? 0,
             lastError: state?.lastError
         )
+    }
+
+    private func localControlLogDTO(_ entry: BuildLogEntry, message: String? = nil) -> LocalControlLogDTO {
+        LocalControlLogDTO(
+            id: entry.id.uuidString,
+            timestamp: entry.timestamp,
+            source: entry.source.rawValue,
+            severity: entry.severity.rawValue,
+            scope: entry.scope.id,
+            message: message ?? entry.message
+        )
+    }
+
+    private func parseSeverity(_ value: String) throws -> BuildLogSeverity {
+        switch value.lowercased() {
+        case "info": return .info
+        case "warning", "warn": return .warning
+        case "error": return .error
+        default:
+            throw LocalControlStoreError.invalidRequest("minimumSeverity must be one of: info, warning, error.")
+        }
+    }
+
+    private func parseSource(_ value: String?) throws -> BuildLogSource? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
+            return nil
+        }
+        guard let source = BuildLogSource(rawValue: value.lowercased()) else {
+            throw LocalControlStoreError.invalidRequest("source must be one of: command, stdout, stderr, system.")
+        }
+        return source
+    }
+
+    private func truncate(_ message: String, maxLength: Int) -> String {
+        guard message.count > maxLength else { return message }
+        let end = message.index(message.startIndex, offsetBy: maxLength)
+        return String(message[..<end]) + "... [truncated \(message.count - maxLength) chars]"
     }
 
     private func localControlDeviceState(_ deviceId: String) throws -> DeviceState {
@@ -359,11 +455,25 @@ private extension BuildLogSeverity {
         case .error: return "error"
         }
     }
+
+    var rank: Int {
+        switch self {
+        case .info: return 0
+        case .warning: return 1
+        case .error: return 2
+        }
+    }
 }
 
 private extension Duration {
     var seconds: TimeInterval {
         let (s, atto) = components
         return Double(s) + Double(atto) * 1e-18
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

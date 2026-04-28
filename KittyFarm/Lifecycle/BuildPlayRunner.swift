@@ -122,7 +122,8 @@ struct BuildPlayRunner {
                         ["launch", "--terminate-running-process", udid, bundleID],
                         context: "simctl launch \(bundleID)",
                         logPrefix: devicePrefix,
-                        logger: logger
+                        logger: logger,
+                        environment: XcrunUtils.simulatorAppLaunchEnvironment
                     )
                 }
             }
@@ -414,11 +415,13 @@ struct BuildPlayRunner {
         _ arguments: [String],
         context: String,
         logPrefix: String? = nil,
-        logger: Logger?
+        logger: Logger?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) async throws {
         let result = try await runLoggedCommand(.init(
             executableURL: xcrunURL,
-            arguments: ["simctl"] + arguments
+            arguments: ["simctl"] + arguments,
+            environment: environment
         ), context: context, logPrefix: logPrefix, logger: logger)
         try result.requireSuccess(context)
     }

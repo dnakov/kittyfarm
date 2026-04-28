@@ -49,6 +49,38 @@ struct LocalControlLogsResponse: Codable, Sendable {
     let logs: [LocalControlLogDTO]
 }
 
+struct LocalControlReadLogsRequest: Codable, Sendable {
+    let limit: Int?
+    let minimumSeverity: String?
+    let source: String?
+    let scope: String?
+    let search: String?
+    let since: Date?
+    let maxMessageLength: Int?
+    let newestFirst: Bool?
+}
+
+struct LocalControlReadLogsResponse: Codable, Sendable {
+    let totalAvailable: Int
+    let matchedCount: Int
+    let returnedCount: Int
+    let omittedCount: Int
+    let truncatedMessageCount: Int
+    let limit: Int
+    let maxMessageLength: Int
+    let filters: LocalControlLogFilters
+    let logs: [LocalControlLogDTO]
+}
+
+struct LocalControlLogFilters: Codable, Sendable {
+    let minimumSeverity: String
+    let source: String?
+    let scope: String?
+    let search: String?
+    let since: Date?
+    let newestFirst: Bool
+}
+
 struct LocalControlLogDTO: Codable, Sendable {
     let id: String
     let timestamp: Date
@@ -56,6 +88,51 @@ struct LocalControlLogDTO: Codable, Sendable {
     let severity: String
     let scope: String
     let message: String
+}
+
+struct LocalControlCrashReportsRequest: Codable, Sendable {
+    let processName: String?
+    let bundleId: String?
+    let search: String?
+    let since: Date?
+    let limit: Int?
+    let maxExcerptLength: Int?
+    let includeExcerpt: Bool?
+}
+
+struct LocalControlCrashReportsResponse: Codable, Sendable {
+    let totalAvailable: Int
+    let matchedCount: Int
+    let returnedCount: Int
+    let omittedCount: Int
+    let limit: Int
+    let filters: LocalControlCrashReportFilters
+    let reports: [LocalControlCrashReportDTO]
+}
+
+struct LocalControlCrashReportFilters: Codable, Sendable {
+    let processName: String?
+    let bundleId: String?
+    let search: String?
+    let since: Date?
+    let includeExcerpt: Bool
+    let maxExcerptLength: Int
+}
+
+struct LocalControlCrashReportDTO: Codable, Sendable {
+    let path: String
+    let fileName: String
+    let modifiedAt: Date
+    let processName: String?
+    let bundleIdentifier: String?
+    let dateTime: String?
+    let exceptionType: String?
+    let terminationReason: String?
+    let triggeredThread: String?
+    let crashedThreadTitle: String?
+    let topFrames: [String]
+    let excerpt: String?
+    let truncated: Bool
 }
 
 struct LocalControlConnectRequest: Codable, Sendable {

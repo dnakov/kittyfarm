@@ -76,6 +76,11 @@ enum DeviceDescriptor: Hashable, Identifiable, Sendable {
         return udid
     }
 
+    var canRunIOSApps: Bool {
+        guard case let .iOSSimulator(_, _, runtime) = self else { return false }
+        return runtime.localizedCaseInsensitiveContains("iOS")
+    }
+
     var defaultAspectRatio: CGFloat {
         switch self {
         case let .iOSSimulator(_, name, _):

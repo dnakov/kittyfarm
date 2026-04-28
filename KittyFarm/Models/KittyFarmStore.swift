@@ -631,7 +631,7 @@ final class KittyFarmStore {
             return
         }
 
-        let iosDevices = activeDevices.map(\.descriptor).filter { $0.platform == .iOSSimulator }
+        let iosDevices = activeDevices.map(\.descriptor).filter(\.canRunIOSApps)
         let androidDevices = activeDevices.map(\.descriptor).filter { $0.platform == .androidEmulator }
 
         guard !iosDevices.isEmpty || !androidDevices.isEmpty else {
@@ -788,8 +788,13 @@ final class KittyFarmStore {
         guard !isRunningBuildAndPlay else { return }
 
         let descriptor = device.descriptor
-        let iosDevices = descriptor.platform == .iOSSimulator ? [descriptor] : []
+        let iosDevices = descriptor.canRunIOSApps ? [descriptor] : []
         let androidDevices = descriptor.platform == .androidEmulator ? [descriptor] : []
+
+        if descriptor.platform == .iOSSimulator, !descriptor.canRunIOSApps {
+            statusMessage = "\(descriptor.displayName) runs \(descriptor.osVersion ?? "a non-iOS runtime") and cannot launch an iOS app target."
+            return
+        }
 
         if !iosDevices.isEmpty, selectedIOSProject == nil {
             statusMessage = "Choose an iOS project before building."

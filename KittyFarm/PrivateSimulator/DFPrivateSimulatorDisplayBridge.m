@@ -20,12 +20,53 @@
 #define DFGSEventTypeDeviceOrientationChanged 50
 
 static NSString * const DFPrivateSimulatorErrorDomain = @"KittyFarm.PrivateSimulator";
-static NSString * const DFSimulatorKitPath = @"/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit";
 static NSString * const DFCoreSimulatorPath = @"/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator";
 static NSString * const DFPrivateSimulatorLogPath = @"/tmp/kittyfarm-private-bridge.log";
 static const void *DFPrivateSimulatorCallbackQueueKey = &DFPrivateSimulatorCallbackQueueKey;
 static const void *DFDigitizerDelegateAssociationKey = &DFDigitizerDelegateAssociationKey;
 static const void *DFDigitizerWakeDelegateAssociationKey = &DFDigitizerWakeDelegateAssociationKey;
+
+static NSString *DFXcodeSelectDeveloperDirectory(void) {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcode-select"];
+    task.arguments = @[@"-p"];
+
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = [NSPipe pipe];
+
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) {
+        return nil;
+    }
+    [task waitUntilExit];
+    if (task.terminationStatus != 0) {
+        return nil;
+    }
+
+    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+    NSString *path = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    path = [path stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return path.length > 0 ? path : nil;
+}
+
+static NSString *DFDeveloperDirectory(void) {
+    NSString *environmentValue = [NSProcessInfo processInfo].environment[@"DEVELOPER_DIR"];
+    if (environmentValue.length > 0) {
+        return environmentValue.stringByStandardizingPath;
+    }
+
+    NSString *selected = DFXcodeSelectDeveloperDirectory();
+    if (selected.length > 0) {
+        return selected.stringByStandardizingPath;
+    }
+
+    return @"/Applications/Xcode.app/Contents/Developer";
+}
+
+static NSString *DFSimulatorKitPath(void) {
+    return [DFDeveloperDirectory() stringByAppendingPathComponent:@"Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit"];
+}
 
 typedef struct IndigoHIDMessageStruct IndigoHIDMessage;
 typedef uint32_t IndigoHIDEdge;
@@ -1924,10 +1965,11 @@ static BOOL DFPressHomeViaHIDClient(id hidClient, NSError **error) {
             return;
         }
 
-        if (!dlopen(DFSimulatorKitPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL)) {
+        NSString *simulatorKitPath = DFSimulatorKitPath();
+        if (!dlopen(simulatorKitPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL)) {
             loadError = DFMakeError(
                 DFPrivateSimulatorErrorCodeFrameworkLoadFailed,
-                [NSString stringWithFormat:@"Unable to load SimulatorKit from %@.", DFSimulatorKitPath]
+                [NSString stringWithFormat:@"Unable to load SimulatorKit from %@.", simulatorKitPath]
             );
         }
     });
@@ -2012,7 +2054,7 @@ static BOOL DFPressHomeViaHIDClient(id hidClient, NSError **error) {
     _serviceContext = ((id(*)(id, SEL, id, long long, NSError **))objc_msgSend)(
         contextAlloc,
         sel_registerName("initWithDeveloperDir:connectionType:error:"),
-        nil,
+        DFDeveloperDirectory(),
         0LL,
         &serviceError
     );

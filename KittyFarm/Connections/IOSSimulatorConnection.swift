@@ -113,7 +113,10 @@ final class IOSSimulatorConnection: NSObject, DeviceConnection, @preconcurrency 
             : try await Self.resolveIOSBundleID(name: nameOrBundleID, udid: udid)
 
         let result = try await ProcessRunner.run(
-            XcrunUtils.simctl(["launch", udid, bundleID])
+            XcrunUtils.simctl(
+                ["launch", "--terminate-running-process", udid, bundleID],
+                environment: XcrunUtils.simulatorAppLaunchEnvironment
+            )
         )
         try result.requireSuccess("simctl launch \(bundleID)")
     }

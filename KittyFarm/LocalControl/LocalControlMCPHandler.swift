@@ -142,6 +142,10 @@ enum LocalControlMCPHandler {
         case "kittyfarm_get_logs":
             let limit = arguments["limit"] as? Int ?? 200
             return try textResult(store.localControlLogs(limit: limit))
+        case "kittyfarm_read_logs":
+            return try textResult(store.localControlReadLogs(decode(LocalControlReadLogsRequest.self, from: arguments)))
+        case "kittyfarm_read_crash_reports":
+            return try textResult(store.localControlCrashReports(decode(LocalControlCrashReportsRequest.self, from: arguments)))
         default:
             throw LocalControlStoreError.invalidRequest("Unknown KittyFarm MCP tool: \(name)")
         }
@@ -149,7 +153,9 @@ enum LocalControlMCPHandler {
 
     private static func decode<T: Decodable>(_ type: T.Type, from arguments: [String: Any]) throws -> T {
         let data = try JSONSerialization.data(withJSONObject: arguments)
-        return try JSONDecoder().decode(type, from: data)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(type, from: data)
     }
 
     private static func textResult(_ value: any Encodable) throws -> [String: Any] {
@@ -249,6 +255,8 @@ enum LocalControlMCPHandler {
         tool("kittyfarm_discover_project", "Discover Project", "Discover iOS and/or Android project settings from a path.", discoverSchema()),
         tool("kittyfarm_build_and_run", "Build And Run", "Build and launch selected projects on active devices.", buildRunSchema()),
         tool("kittyfarm_get_logs", "Get Logs", "Return recent KittyFarm build/runtime logs.", logsSchema()),
+        tool("kittyfarm_read_logs", "Read Logs", "Read bounded, filtered KittyFarm logs with truncation metadata for MCP diagnostics.", readLogsSchema()),
+        tool("kittyfarm_read_crash_reports", "Read Crash Reports", "Read recent bounded macOS DiagnosticReports crash logs for KittyFarm-launched apps.", crashReportsSchema()),
     ]
 
     private static func tool(_ name: String, _ title: String, _ description: String, _ inputSchema: [String: Any]) -> [String: Any] {
@@ -372,6 +380,69 @@ enum LocalControlMCPHandler {
 
     private static func logsSchema() -> [String: Any] {
         schema(properties: ["limit": ["type": "integer", "minimum": 1, "maximum": 1000]])
+    }
+
+    private static func readLogsSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "limit": [
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "description": "Maximum entries to return. Defaults to 50 and is capped at 200.",
+                ],
+                "minimumSeverity": [
+                    "type": "string",
+                    "enum": ["info", "warning", "error"],
+                    "description": "Return entries at this severity or higher. Defaults to info.",
+                ],
+                "source": [
+                    "type": "string",
+                    "enum": ["command", "stdout", "stderr", "system"],
+                    "description": "Optional exact log source filter.",
+                ],
+                "scope": string("Optional exact scope id, such as build or device:<name>."),
+                "search": string("Optional case-insensitive substring filter."),
+                "since": string("Optional ISO-8601 timestamp. Entries before this are skipped."),
+                "maxMessageLength": [
+                    "type": "integer",
+                    "minimum": 120,
+                    "maximum": 2000,
+                    "description": "Maximum characters per returned message. Defaults to 600.",
+                ],
+                "newestFirst": [
+                    "type": "boolean",
+                    "description": "Return newest entries first. Defaults to false so tail results stay chronological.",
+                ],
+            ]
+        )
+    }
+
+    private static func crashReportsSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "processName": string("Optional process name filter, such as Workouts-iOS or KittyFarm."),
+                "bundleId": string("Optional bundle identifier filter, such as com.mweinbach.Workouts."),
+                "search": string("Optional case-insensitive full-report substring filter."),
+                "since": string("Optional ISO-8601 timestamp. Reports older than this are skipped."),
+                "limit": [
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 25,
+                    "description": "Maximum crash reports to return. Defaults to 5 and is capped at 25.",
+                ],
+                "maxExcerptLength": [
+                    "type": "integer",
+                    "minimum": 500,
+                    "maximum": 20000,
+                    "description": "Maximum characters of each report excerpt. Defaults to 4000.",
+                ],
+                "includeExcerpt": [
+                    "type": "boolean",
+                    "description": "Include a bounded report excerpt. Defaults to true.",
+                ],
+            ]
+        )
     }
 
     private static func string(_ description: String) -> [String: Any] {
