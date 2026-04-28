@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Bindable var store: KittyFarmStore
+    @State private var hoveredToolbarControl: ToolbarControl?
 
     var body: some View {
         NavigationStack {
@@ -43,6 +44,7 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(store.activeDevices.isEmpty)
+                        .onHover { setToolbarHover(.shutdownAll, isHovering: $0) }
                         .help("Shutdown all simulators & emulators")
 
                         Divider()
@@ -59,6 +61,7 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(store.activeDevices.isEmpty)
+                        .onHover { setToolbarHover(.screenRecordings, isHovering: $0) }
                         .help(store.isAnyScreenRecording ? "Stop all screen recordings" : "Record all active devices separately")
 
                         Divider()
@@ -75,11 +78,15 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(store.activeDevices.isEmpty || store.isRunningBuildAndPlay)
+                        .onHover { setToolbarHover(.buildAndPlay, isHovering: $0) }
                         .help(store.isRunningBuildAndPlay ? "Building…" : "Build & Play")
                     }
                     .padding(.horizontal, 4)
                     .padding(.vertical, 4)
                     .glassEffect(.regular, in: .capsule)
+                    .overlay(alignment: .top) {
+                        toolbarHoverBubble
+                    }
                 }
 
             }
@@ -221,6 +228,48 @@ struct ContentView: View {
             return (failed, .red)
         }
         return (store.testResults.count, .green)
+    }
+
+    @ViewBuilder
+    private var toolbarHoverBubble: some View {
+        if let hoveredToolbarControl {
+            Text(hoveredToolbarControl.title(for: store))
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .glassEffect(.regular, in: .capsule)
+                .offset(y: -34)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .allowsHitTesting(false)
+                .zIndex(10)
+        }
+    }
+
+    private func setToolbarHover(_ control: ToolbarControl, isHovering: Bool) {
+        withAnimation(.smooth(duration: 0.12)) {
+            hoveredToolbarControl = isHovering ? control : (hoveredToolbarControl == control ? nil : hoveredToolbarControl)
+        }
+    }
+}
+
+private enum ToolbarControl: Equatable {
+    case shutdownAll
+    case screenRecordings
+    case buildAndPlay
+
+    @MainActor
+    func title(for store: KittyFarmStore) -> String {
+        switch self {
+        case .shutdownAll:
+            return "Shutdown all devices"
+        case .screenRecordings:
+            return store.isAnyScreenRecording ? "Stop screen recordings" : "Record active devices separately"
+        case .buildAndPlay:
+            return store.isRunningBuildAndPlay ? "Build in progress" : "Build and launch apps"
+        }
     }
 }
 
