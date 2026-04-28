@@ -36,7 +36,7 @@ enum MCPConfigurationTarget: String, CaseIterable, Identifiable {
         case .codex:
             return home.appending(path: ".codex/config.toml")
         case .claude:
-            return home.appending(path: "Library/Application Support/Claude/claude_desktop_config.json")
+            return home.appending(path: ".claude.json")
         case .opencode:
             return home.appending(path: ".config/opencode/opencode.json")
         case .pi:
@@ -95,6 +95,7 @@ enum MCPConfigurationInstaller {
         servers["kittyfarm"] = [
             "type": "http",
             "url": mcpURL,
+            "headers": [:],
         ]
         json["mcpServers"] = servers
         try writeJSON(json, to: url)
