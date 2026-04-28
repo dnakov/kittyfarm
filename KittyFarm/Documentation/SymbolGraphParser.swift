@@ -3,11 +3,10 @@ import Foundation
 enum SymbolGraphParser {
     static func parse(data: Data, platform: DocumentationPlatform, sdkName: String) throws -> [IndexedDocumentationSymbol] {
         let graph = try JSONDecoder().decode(SymbolGraph.self, from: data)
-        let memberOf = Dictionary(
-            uniqueKeysWithValues: graph.relationships
-                .filter { $0.kind == "memberOf" }
-                .map { ($0.source, $0.target) }
-        )
+        var memberOf: [String: String] = [:]
+        for relationship in graph.relationships where relationship.kind == "memberOf" {
+            memberOf[relationship.source, default: relationship.target] = relationship.target
+        }
 
         return graph.symbols.compactMap { symbol in
             guard !symbol.spi, symbol.accessLevel != "private", symbol.accessLevel != "internal" else {

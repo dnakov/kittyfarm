@@ -22,14 +22,7 @@ struct DocumentationSearchView: View {
             Divider()
             controls
             Divider()
-
-            HSplitView {
-                resultsList
-                    .frame(minWidth: 280, idealWidth: 340)
-
-                detailPane
-                    .frame(minWidth: 360)
-            }
+            content
         }
         .task {
             status = await store.documentationIndexStatus()
@@ -64,7 +57,7 @@ struct DocumentationSearchView: View {
                     .controlSize(.small)
             }
 
-            Button("Build Index") {
+            Button(status.symbolCount == 0 ? "Build Index" : "Rebuild Index") {
                 Task {
                     await store.rebuildDocumentationIndex()
                     status = await store.documentationIndexStatus()
@@ -97,42 +90,47 @@ struct DocumentationSearchView: View {
         .padding(18)
     }
 
+    @ViewBuilder
+    private var content: some View {
+        if store.isIndexingDocumentation && results.isEmpty {
+            indexingState
+        } else if isSearching && results.isEmpty {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if results.isEmpty {
+            emptyState
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            HSplitView {
+                resultsList
+                    .frame(minWidth: 320, idealWidth: 380)
+
+                detailPane
+                    .frame(minWidth: 420)
+            }
+        }
+    }
+
     private var controls: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                TextField("Search Apple documentation", text: $query)
-                    .textFieldStyle(.roundedBorder)
+        HStack(spacing: 10) {
+            TextField("Search Apple documentation", text: $query)
+                .textFieldStyle(.roundedBorder)
 
-                Picker("Mode", selection: $mode) {
-                    Text("Symbols").tag(DocumentationSearchMode.symbols)
-                    Text("Docs").tag(DocumentationSearchMode.docs)
-                    Text("All").tag(DocumentationSearchMode.all)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 220)
-
-                Picker("Platform", selection: $platformFilter) {
-                    Text("All").tag("all")
-                    ForEach(DocumentationPlatform.allCases) { platform in
-                        Text(platform.displayName).tag(platform.rawValue)
-                    }
-                }
-                .frame(width: 150)
+            Picker("Mode", selection: $mode) {
+                Text("Symbols").tag(DocumentationSearchMode.symbols)
+                Text("Docs").tag(DocumentationSearchMode.docs)
+                Text("All").tag(DocumentationSearchMode.all)
             }
+            .pickerStyle(.segmented)
+            .frame(width: 220)
 
-            if let progress = store.documentationIndexProgressMessage {
-                Text(progress)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else if let message = nonEmptyStatusMessage {
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(errorMessage == nil ? .secondary : Color.red)
-            } else if mode != .symbols, !status.semanticDocsAvailable, let semanticError = status.semanticDocsError {
-                Text(semanticError)
-                    .font(.caption)
-                    .foregroundStyle(Color.orange)
+            Picker("Platform", selection: $platformFilter) {
+                Text("All").tag("all")
+                ForEach(DocumentationPlatform.allCases) { platform in
+                    Text(platform.displayName).tag(platform.rawValue)
+                }
             }
+            .frame(width: 150)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
@@ -179,11 +177,6 @@ struct DocumentationSearchView: View {
                 }
                 .padding(.vertical, 4)
                 .tag(result.id)
-            }
-        }
-        .overlay {
-            if results.isEmpty && !isSearching {
-                emptyState
             }
         }
     }
@@ -267,6 +260,18 @@ struct DocumentationSearchView: View {
         }
     }
 
+    private var indexingState: some View {
+        ContentUnavailableView {
+            Label("Building Documentation Index", systemImage: "books.vertical")
+        } description: {
+            Text(store.documentationIndexProgressMessage ?? "Extracting Apple SDK symbol graphs in batches.")
+        } actions: {
+            ProgressView()
+                .controlSize(.regular)
+                .padding(.top, 4)
+        }
+    }
+
     private var selectedPlatform: DocumentationPlatform? {
         guard platformFilter != "all" else { return nil }
         return DocumentationPlatform(rawValue: platformFilter)
@@ -277,10 +282,26 @@ struct DocumentationSearchView: View {
     }
 
     private var statusText: String {
+        if let message = headerStatusMessage {
+            return message
+        }
         if status.symbolCount > 0 {
             return "\(status.symbolCount) symbols indexed" + (status.indexedSDKs.isEmpty ? "" : " from \(status.indexedSDKs.joined(separator: ", "))")
         }
         return "Build the local symbol index to search Apple SDK symbols."
+    }
+
+    private var headerStatusMessage: String? {
+        if let progress = store.documentationIndexProgressMessage {
+            return progress
+        }
+        if let message = nonEmptyStatusMessage {
+            return message
+        }
+        if mode != .symbols, !status.semanticDocsAvailable, let semanticError = status.semanticDocsError {
+            return semanticError
+        }
+        return nil
     }
 
     private var nonEmptyStatusMessage: String? {

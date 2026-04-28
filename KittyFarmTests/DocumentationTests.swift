@@ -130,7 +130,9 @@ final class DocumentationTests: XCTestCase {
         let callResult = try XCTUnwrap(callObject["result"] as? [String: Any])
         let content = try XCTUnwrap(callResult["content"] as? [[String: Any]])
         let text = try XCTUnwrap(content.first?["text"] as? String)
-        let decoded = try JSONDecoder().decode(DocumentationSearchResponse.self, from: Data(text.utf8))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(DocumentationSearchResponse.self, from: Data(text.utf8))
 
         XCTAssertLessThanOrEqual(decoded.results.count, 3)
         XCTAssertNotNil(decoded.indexStatus)
@@ -223,6 +225,12 @@ final class DocumentationTests: XCTestCase {
                 }
               ],
               "relationships": [
+                {
+                  "kind": "memberOf",
+                  "source": "s:SwiftUI.NavigationStack.init",
+                  "target": "s:SwiftUI.NavigationStack",
+                  "targetFallback": "NavigationStack"
+                },
                 {
                   "kind": "memberOf",
                   "source": "s:SwiftUI.NavigationStack.init",

@@ -12,6 +12,20 @@ struct DocumentationIndexBuildResult: Sendable {
     let failures: [DocumentationIndexFailure]
 }
 
+private struct DocumentationExtractionJob: Sendable {
+    let sdk: SDKTarget
+    let module: String
+    let outputDirectory: URL
+}
+
+private struct DocumentationExtractionResult: Sendable {
+    let sdk: SDKTarget
+    let module: String
+    let outputDirectory: URL
+    let symbols: [IndexedDocumentationSymbol]
+    let failure: DocumentationIndexFailure?
+}
+
 actor DocumentationIndexer {
     typealias ProgressHandler = @Sendable (DocumentationIndexProgress) async -> Void
 
@@ -59,32 +73,54 @@ actor DocumentationIndexer {
         var completed = 0
         var symbols: [IndexedDocumentationSymbol] = []
         var failures: [DocumentationIndexFailure] = []
+        var jobs: [DocumentationExtractionJob] = []
 
         for (sdk, modules) in modulesBySDK {
-            let outputDirectory = try temporaryDirectory(prefix: "kittyfarm-symbolgraphs-\(sdk.name)")
-            defer { try? fileManager.removeItem(at: outputDirectory) }
-
             for module in modules {
-                try Task.checkCancellation()
-                await progress?(DocumentationIndexProgress(
-                    message: "Indexing \(module) from \(sdk.displayName)",
-                    completed: completed,
-                    total: total
+                jobs.append(DocumentationExtractionJob(
+                    sdk: sdk,
+                    module: module,
+                    outputDirectory: try temporaryDirectory(prefix: "kittyfarm-symbolgraphs-\(sdk.name)-\(module)")
                 ))
+            }
+        }
+        defer {
+            for job in jobs {
+                try? fileManager.removeItem(at: job.outputDirectory)
+            }
+        }
 
-                do {
-                    let files = try await extract(module: module, sdk: sdk, outputDirectory: outputDirectory)
-                    for file in files {
-                        symbols += try SymbolGraphParser.parse(fileURL: file, platform: sdk.platform, sdkName: sdk.name)
+        let batchSize = Self.batchSize
+        for batch in jobs.chunked(size: batchSize) {
+            try Task.checkCancellation()
+            let moduleList = batch.map { "\($0.module) (\($0.sdk.displayName))" }.joined(separator: ", ")
+            await progress?(DocumentationIndexProgress(
+                message: "Indexing \(batch.count) modules: \(moduleList)",
+                completed: completed,
+                total: total
+            ))
+
+            await withTaskGroup(of: DocumentationExtractionResult.self) { group in
+                for job in batch {
+                    group.addTask {
+                        await Self.extract(job)
                     }
-                } catch {
-                    failures.append(DocumentationIndexFailure(
-                        sdk: sdk.name,
-                        module: module,
-                        message: error.localizedDescription
+                }
+
+                for await result in group {
+                    symbols += result.symbols
+                    if let failure = result.failure {
+                        failures.append(failure)
+                    }
+                    completed += 1
+                    await progress?(DocumentationIndexProgress(
+                        message: result.failure == nil
+                            ? "Indexed \(result.module) from \(result.sdk.displayName)"
+                            : "Skipped \(result.module) from \(result.sdk.displayName)",
+                        completed: completed,
+                        total: total
                     ))
                 }
-                completed += 1
             }
         }
 
@@ -96,6 +132,10 @@ actor DocumentationIndexer {
             total: total
         ))
         return DocumentationIndexBuildResult(symbolCount: symbols.count, indexedSDKs: indexedSDKs, failures: failures)
+    }
+
+    private static var batchSize: Int {
+        max(2, min(6, ProcessInfo.processInfo.activeProcessorCount / 2))
     }
 
     private func detectSDKs() async throws -> [SDKTarget] {
@@ -135,10 +175,40 @@ actor DocumentationIndexer {
             .sorted()
     }
 
-    private func extract(module: String, sdk: SDKTarget, outputDirectory: URL) async throws -> [URL] {
+    private nonisolated static func extract(_ job: DocumentationExtractionJob) async -> DocumentationExtractionResult {
+        do {
+            try Task.checkCancellation()
+            let files = try await extract(module: job.module, sdk: job.sdk, outputDirectory: job.outputDirectory)
+            var symbols: [IndexedDocumentationSymbol] = []
+            for file in files {
+                symbols += try SymbolGraphParser.parse(fileURL: file, platform: job.sdk.platform, sdkName: job.sdk.name)
+            }
+            return DocumentationExtractionResult(
+                sdk: job.sdk,
+                module: job.module,
+                outputDirectory: job.outputDirectory,
+                symbols: symbols,
+                failure: nil
+            )
+        } catch {
+            return DocumentationExtractionResult(
+                sdk: job.sdk,
+                module: job.module,
+                outputDirectory: job.outputDirectory,
+                symbols: [],
+                failure: DocumentationIndexFailure(
+                    sdk: job.sdk.name,
+                    module: job.module,
+                    message: error.localizedDescription
+                )
+            )
+        }
+    }
+
+    private nonisolated static func extract(module: String, sdk: SDKTarget, outputDirectory: URL) async throws -> [URL] {
         let before = try symbolGraphFiles(in: outputDirectory)
         let result = try await ProcessRunner.run(ProcessRunner.Command(
-            executableURL: xcrunURL,
+            executableURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
             arguments: [
                 "swift", "symbolgraph-extract",
                 "-module-name", module,
@@ -153,9 +223,9 @@ actor DocumentationIndexer {
         return Array(Set(after).subtracting(before)).sorted { $0.path < $1.path }
     }
 
-    private func symbolGraphFiles(in directory: URL) throws -> [URL] {
-        guard fileManager.fileExists(atPath: directory.path) else { return [] }
-        return try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+    private nonisolated static func symbolGraphFiles(in directory: URL) throws -> [URL] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasSuffix(".symbols.json") }
     }
 
@@ -163,6 +233,20 @@ actor DocumentationIndexer {
         let url = fileManager.temporaryDirectory.appending(path: "\(prefix)-\(UUID().uuidString)", directoryHint: .isDirectory)
         try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+}
+
+private extension Array {
+    func chunked(size: Int) -> [[Element]] {
+        guard size > 0 else { return [self] }
+        var result: [[Element]] = []
+        var index = startIndex
+        while index < endIndex {
+            let next = self.index(index, offsetBy: size, limitedBy: endIndex) ?? endIndex
+            result.append(Array(self[index..<next]))
+            index = next
+        }
+        return result
     }
 }
 

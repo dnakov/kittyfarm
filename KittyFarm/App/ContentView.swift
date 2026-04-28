@@ -126,7 +126,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $store.isPresentingDocumentationSearch) {
             DocumentationSearchView(store: store)
-                .frame(minWidth: 780, minHeight: 540)
+                .frame(minWidth: 900, minHeight: 620)
         }
     }
 
