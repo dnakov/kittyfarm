@@ -76,6 +76,18 @@ enum DeviceDescriptor: Hashable, Identifiable, Sendable {
         return udid
     }
 
+    var isWatchSimulator: Bool {
+        guard case let .iOSSimulator(_, name, runtime) = self else { return false }
+        return runtime.localizedCaseInsensitiveContains("watchOS")
+            || name.localizedCaseInsensitiveContains("Watch")
+    }
+
+    var isIPhoneSimulator: Bool {
+        guard case let .iOSSimulator(_, name, runtime) = self else { return false }
+        return runtime.localizedCaseInsensitiveContains("iOS")
+            && name.localizedCaseInsensitiveContains("iPhone")
+    }
+
     var canRunIOSApps: Bool {
         guard case let .iOSSimulator(_, _, runtime) = self else { return false }
         return runtime.localizedCaseInsensitiveContains("iOS")
@@ -84,6 +96,9 @@ enum DeviceDescriptor: Hashable, Identifiable, Sendable {
     var defaultAspectRatio: CGFloat {
         switch self {
         case let .iOSSimulator(_, name, _):
+            if name.localizedCaseInsensitiveContains("Watch") {
+                return 1.0
+            }
             if name.localizedCaseInsensitiveContains("iPad") {
                 return 3.0 / 4.0
             }

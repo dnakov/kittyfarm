@@ -35,6 +35,7 @@ final class KittyFarmStore {
 
     var availableDevices: [DeviceDescriptor] = []
     var activeDevices: [DeviceState] = []
+    var simulatorPairs: [SimulatorPairInfo] = []
     var leaderID: String?
     var activeInputDeviceID: String?
     var syncEnabled = true
@@ -149,9 +150,11 @@ final class KittyFarmStore {
         do {
             async let simulators = simctlManager.listDevices()
             async let emulators = emulatorManager.listAVDs()
+            async let pairs = simctlManager.listDevicePairs()
 
             let simResults = try await simulators
             let emuResults = try await emulators
+            let pairResults = try await pairs
 
             var states: [String: String] = [:]
             var descriptors: [DeviceDescriptor] = []
@@ -169,6 +172,11 @@ final class KittyFarmStore {
                     return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
                 }
                 return lhs.platform.rawValue < rhs.platform.rawValue
+            }
+            let availableSimulatorUDIDs = Set(descriptors.compactMap(\.iosUDID))
+            simulatorPairs = pairResults.filter {
+                availableSimulatorUDIDs.contains($0.watch.udid)
+                    && availableSimulatorUDIDs.contains($0.phone.udid)
             }
             deviceBootStates = states
             statusMessage = availableDevices.isEmpty ? "No simulators or AVDs were discovered." : "Choose devices to populate the grid."
@@ -710,6 +718,8 @@ final class KittyFarmStore {
     func applySelection(_ selectedIDs: Set<String>) async {
         let currentIDs = Set(activeDevices.map(\.id))
 
+        await pairSelectedAppleSimulatorsIfNeeded(selectedIDs)
+
         let toRemove = activeDevices.filter { !selectedIDs.contains($0.id) }
         for device in toRemove {
             await removeDevice(device)
@@ -725,6 +735,42 @@ final class KittyFarmStore {
         }
 
         isPresentingDevicePicker = false
+    }
+
+    func pairingStatus(for descriptor: DeviceDescriptor) -> String? {
+        guard descriptor.platform == .iOSSimulator else { return nil }
+        if let pair = simulatorPairs.first(where: { $0.includes(descriptor) }),
+           let companion = pair.companionName(for: descriptor) {
+            return "Paired with \(companion)"
+        }
+        if descriptor.isWatchSimulator {
+            return "Unpaired Watch"
+        }
+        return nil
+    }
+
+    private func pairSelectedAppleSimulatorsIfNeeded(_ selectedIDs: Set<String>) async {
+        let selectedDevices = availableDevices.filter { selectedIDs.contains($0.id) }
+        let selectedWatches = selectedDevices.filter(\.isWatchSimulator)
+        guard selectedWatches.count == 1 else { return }
+
+        let selectedPhones = selectedDevices.filter(\.isIPhoneSimulator)
+        guard selectedPhones.count == 1 else { return }
+
+        let watch = selectedWatches[0]
+        let phone = selectedPhones[0]
+        guard let watchUDID = watch.iosUDID, let phoneUDID = phone.iosUDID else { return }
+        if simulatorPairs.contains(where: { $0.watch.udid == watchUDID && $0.phone.udid == phoneUDID }) {
+            return
+        }
+
+        do {
+            let pair = try await simctlManager.ensurePaired(watch: watch, phone: phone)
+            simulatorPairs = try await simctlManager.listDevicePairs()
+            statusMessage = "Paired \(pair.watch.name) with \(pair.phone.name)."
+        } catch {
+            statusMessage = "Failed to pair \(watch.displayName) with \(phone.displayName): \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Reordering
