@@ -42,7 +42,6 @@ final class KittyFarmStore {
     var isPresentingDevicePicker = false
     var isPresentingProjectPicker = false
     var isPresentingMCPDashboard = false
-    var isPresentingDocumentationSearch = false
     var isRunningBuildAndPlay = false
     var bottomPanel: BottomPanel = .hidden
     var statusMessage = "Add an iOS simulator or Android emulator to begin."
@@ -74,6 +73,7 @@ final class KittyFarmStore {
     @ObservationIgnored private var reportedCrashReportPaths: Set<String> = []
     @ObservationIgnored private var screenRecorders: [String: DeviceScreenRecorder] = [:]
     @ObservationIgnored private var screenRecordingTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var isPreparingForTermination = false
     @ObservationIgnored let documentationSearchService: DocumentationSearchService?
 
     var localControlStatus: String = "MCP API starting..."
@@ -792,6 +792,45 @@ final class KittyFarmStore {
 
     // MARK: - Shutdown
 
+    func prepareForTermination() async {
+        guard !isPreparingForTermination else { return }
+        isPreparingForTermination = true
+        statusMessage = "Shutting down KittyFarm..."
+
+        crashReportMonitorTask?.cancel()
+        crashReportMonitorTask = nil
+        localControlServer?.stop()
+        localControlServer = nil
+
+        await runtimeLogManager.stopAll()
+
+        for device in activeDevices where device.isScreenRecording {
+            _ = try? await stopScreenRecording(on: device)
+        }
+        for task in screenRecordingTasks.values {
+            task.cancel()
+        }
+        screenRecordingTasks.removeAll()
+
+        isRunningBuildAndPlay = false
+        isRunningTest = false
+        for device in activeDevices {
+            device.isBuildingApp = false
+            device.isConnecting = false
+        }
+
+        await devToolsSessions.stopAll()
+
+        let activeConnections = Array(connections.values)
+        connections.removeAll()
+        for connection in activeConnections {
+            await connection.disconnect()
+        }
+
+        await emulatorManager.stopLaunchedEmulators()
+        ProcessRunner.terminateAllRunning()
+    }
+
     func shutdownAllSimulators() async {
         // Disconnect our iOS devices first
         let iosDevices = activeDevices.filter { $0.descriptor.platform == .iOSSimulator }
@@ -808,22 +847,34 @@ final class KittyFarmStore {
     }
 
     func killAllEmulators() async {
+        await runtimeLogManager.stopAll()
         // Disconnect our Android devices first
         let androidDevices = activeDevices.filter { $0.descriptor.platform == .androidEmulator }
         for device in androidDevices {
             await removeDevice(device)
         }
-        // Kill all emulator processes
-        do {
-            _ = try await ProcessRunner.run(.init(
-                executableURL: URL(fileURLWithPath: "/usr/bin/killall"),
-                arguments: ["qemu-system-aarch64"]
-            ))
-            statusMessage = "All Android emulators killed."
-        } catch {
-            // killall returns error if no processes found — that's fine
-            statusMessage = "Android emulators stopped."
+
+        await emulatorManager.stopLaunchedEmulators()
+
+        let emulatorProcessNames = [
+            "qemu-system-aarch64",
+            "qemu-system-x86_64",
+            "qemu-system-i386",
+        ]
+        var didKillAny = false
+        for processName in emulatorProcessNames {
+            do {
+                let result = try await ProcessRunner.run(.init(
+                    executableURL: URL(fileURLWithPath: "/usr/bin/killall"),
+                    arguments: [processName]
+                ))
+                didKillAny = didKillAny || result.terminationStatus == 0
+            } catch {
+                // Keep trying the remaining emulator process names.
+            }
         }
+
+        statusMessage = didKillAny ? "All Android emulators killed." : "Android emulators stopped."
     }
 
     func shutdownAll() async {
@@ -1273,6 +1324,10 @@ final class KittyFarmStore {
             }
         }
 
+        for context in contexts {
+            await stopTreeProvider(context.provider)
+        }
+
         isRunningTest = false
     }
 
@@ -1289,6 +1344,12 @@ final class KittyFarmStore {
             let width = Double(size?.width ?? 1080)
             let height = Double(size?.height ?? 2400)
             return LazyAndroidAccessibilityProvider(avdName: avdName, screenWidth: width, screenHeight: height)
+        }
+    }
+
+    private func stopTreeProvider(_ provider: any AccessibilityTreeProvider) async {
+        if let provider = provider as? IOSAccessibilityProvider {
+            await provider.stop()
         }
     }
 
