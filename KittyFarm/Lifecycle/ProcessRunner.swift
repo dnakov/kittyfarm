@@ -1,5 +1,87 @@
 import Foundation
 
+private final class ProcessRunnerProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var terminationRequested = false
+
+    func set(_ process: Process) {
+        lock.lock()
+        self.process = process
+        let shouldTerminate = terminationRequested
+        lock.unlock()
+
+        if shouldTerminate, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    var isTerminationRequested: Bool {
+        lock.lock()
+        let value = terminationRequested
+        lock.unlock()
+        return value
+    }
+
+    func terminate() {
+        lock.lock()
+        terminationRequested = true
+        let process = self.process
+        lock.unlock()
+
+        if process?.isRunning == true {
+            process?.terminate()
+        }
+    }
+}
+
+private final class ProcessRunnerRegistry: @unchecked Sendable {
+    static let shared = ProcessRunnerRegistry()
+
+    private let lock = NSLock()
+    private var processes: [Int32: Process] = [:]
+
+    func insert(_ process: Process) {
+        lock.lock()
+        processes[process.processIdentifier] = process
+        lock.unlock()
+    }
+
+    func remove(_ process: Process) {
+        lock.lock()
+        processes.removeValue(forKey: process.processIdentifier)
+        lock.unlock()
+    }
+
+    func terminateAll() {
+        lock.lock()
+        let runningProcesses = Array(processes.values)
+        lock.unlock()
+
+        for process in runningProcesses where process.isRunning {
+            process.terminate()
+        }
+    }
+}
+
+private final class ProcessRunnerWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Int32, Never>?
+
+    init(_ continuation: CheckedContinuation<Int32, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ status: Int32) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+
+        continuation?.resume(returning: status)
+    }
+}
+
 struct ProcessRunner {
     struct Command: Sendable {
         var executableURL: URL
@@ -43,54 +125,73 @@ struct ProcessRunner {
         _ command: Command,
         onOutput: (@Sendable (OutputEvent) async -> Void)? = nil
     ) async throws -> Result {
-        try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            let stdoutPipe = Pipe()
-            let stderrPipe = Pipe()
-            let stdinPipe = command.stdinData == nil ? nil : Pipe()
+        let processBox = ProcessRunnerProcessBox()
 
-            process.executableURL = command.executableURL
-            process.arguments = command.arguments
-            process.environment = command.environment
-            process.currentDirectoryURL = command.currentDirectoryURL
-            process.standardOutput = stdoutPipe
-            process.standardError = stderrPipe
-            process.standardInput = stdinPipe
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                let process = Process()
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                let stdinPipe = command.stdinData == nil ? nil : Pipe()
+                processBox.set(process)
 
-            let stdoutTask = Task {
-                try await collectOutput(
-                    from: stdoutPipe.fileHandleForReading,
-                    stream: .stdout,
-                    onOutput: onOutput
+                process.executableURL = command.executableURL
+                process.arguments = command.arguments
+                process.environment = command.environment
+                process.currentDirectoryURL = command.currentDirectoryURL
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+                process.standardInput = stdinPipe
+
+                let stdoutTask = Task {
+                    try await collectOutput(
+                        from: stdoutPipe.fileHandleForReading,
+                        stream: .stdout,
+                        onOutput: onOutput
+                    )
+                }
+
+                let stderrTask = Task {
+                    try await collectOutput(
+                        from: stderrPipe.fileHandleForReading,
+                        stream: .stderr,
+                        onOutput: onOutput
+                    )
+                }
+
+                try process.run()
+                ProcessRunnerRegistry.shared.insert(process)
+                defer {
+                    ProcessRunnerRegistry.shared.remove(process)
+                }
+
+                if processBox.isTerminationRequested, process.isRunning {
+                    process.terminate()
+                }
+
+                if let stdinPipe, let stdinData = command.stdinData {
+                    try stdinPipe.fileHandleForWriting.write(contentsOf: stdinData)
+                    try stdinPipe.fileHandleForWriting.close()
+                }
+
+                let terminationStatus = try await waitForProcess(process)
+
+                let stdoutData = try await stdoutTask.value
+                let stderrData = try await stderrTask.value
+
+                return Result(
+                    stdoutData: stdoutData,
+                    stderrData: stderrData,
+                    terminationStatus: terminationStatus
                 )
-            }
+            }.value
+        } onCancel: {
+            processBox.terminate()
+        }
+    }
 
-            let stderrTask = Task {
-                try await collectOutput(
-                    from: stderrPipe.fileHandleForReading,
-                    stream: .stderr,
-                    onOutput: onOutput
-                )
-            }
-
-            try process.run()
-
-            if let stdinPipe, let stdinData = command.stdinData {
-                try stdinPipe.fileHandleForWriting.write(contentsOf: stdinData)
-                try stdinPipe.fileHandleForWriting.close()
-            }
-
-            let terminationStatus = try await waitForProcess(process)
-
-            let stdoutData = try await stdoutTask.value
-            let stderrData = try await stderrTask.value
-
-            return Result(
-                stdoutData: stdoutData,
-                stderrData: stderrData,
-                terminationStatus: terminationStatus
-            )
-        }.value
+    static func terminateAllRunning() {
+        ProcessRunnerRegistry.shared.terminateAll()
     }
 
     private static func collectOutput(
@@ -149,9 +250,19 @@ struct ProcessRunner {
     }
 
     private static func waitForProcess(_ process: Process) async throws -> Int32 {
-        try await withCheckedThrowingContinuation { continuation in
+        if !process.isRunning {
+            return process.terminationStatus
+        }
+
+        return await withCheckedContinuation { continuation in
+            let waiter = ProcessRunnerWaiter(continuation)
             process.terminationHandler = { finishedProcess in
-                continuation.resume(returning: finishedProcess.terminationStatus)
+                waiter.resume(finishedProcess.terminationStatus)
+            }
+
+            if !process.isRunning {
+                process.terminationHandler = nil
+                waiter.resume(process.terminationStatus)
             }
         }
     }

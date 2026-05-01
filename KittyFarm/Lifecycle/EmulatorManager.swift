@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 
@@ -83,6 +84,24 @@ actor EmulatorManager {
         try process.run()
         launchedProcesses[avdName] = process
         try await waitForGRPCReady(avdName: avdName, grpcPort: grpcPort, process: process)
+    }
+
+    func stopLaunchedEmulators(gracePeriod: TimeInterval = 5) async {
+        let processes = launchedProcesses
+        launchedProcesses.removeAll()
+
+        for process in processes.values where process.isRunning {
+            process.terminate()
+        }
+
+        let deadline = Date().addingTimeInterval(gracePeriod)
+        while Date() < deadline, processes.values.contains(where: \.isRunning) {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        for process in processes.values where process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
     }
 
     private func waitForGRPCReady(avdName: String, grpcPort: Int, process: Process) async throws {

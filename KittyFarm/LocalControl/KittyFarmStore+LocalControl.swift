@@ -91,7 +91,15 @@ extension KittyFarmStore {
 
     func localControlAccessibilityTree(deviceId: String, bundleId: String?) async throws -> [AccessibilityElement] {
         let state = try localControlDeviceState(deviceId)
-        return try await localControlTreeProvider(for: state, bundleId: bundleId).fetchTree(bundleIdentifier: bundleId)
+        let provider = localControlTreeProvider(for: state, bundleId: bundleId)
+        do {
+            let tree = try await provider.fetchTree(bundleIdentifier: bundleId)
+            await stopLocalControlTreeProvider(provider)
+            return tree
+        } catch {
+            await stopLocalControlTreeProvider(provider)
+            throw error
+        }
     }
 
     func localControlTap(_ request: LocalControlTapRequest) async throws -> LocalControlOKResponse {
@@ -526,14 +534,26 @@ extension KittyFarmStore {
     private func localControlResolve(deviceId: String, query: String, bundleId: String?) async throws -> LocalControlElementResponse {
         let state = try localControlDeviceState(deviceId)
         let provider = localControlTreeProvider(for: state, bundleId: bundleId)
-        let tree = try await provider.fetchTree(bundleIdentifier: bundleId)
-        let size = try await provider.screenSize()
-        let resolved = try ElementResolver.resolve(query, in: tree, screenWidth: size.width, screenHeight: size.height)
-        return LocalControlElementResponse(
-            element: resolved.element,
-            normalizedX: resolved.normalizedX,
-            normalizedY: resolved.normalizedY
-        )
+        do {
+            let tree = try await provider.fetchTree(bundleIdentifier: bundleId)
+            let size = try await provider.screenSize()
+            let resolved = try ElementResolver.resolve(query, in: tree, screenWidth: size.width, screenHeight: size.height)
+            await stopLocalControlTreeProvider(provider)
+            return LocalControlElementResponse(
+                element: resolved.element,
+                normalizedX: resolved.normalizedX,
+                normalizedY: resolved.normalizedY
+            )
+        } catch {
+            await stopLocalControlTreeProvider(provider)
+            throw error
+        }
+    }
+
+    private func stopLocalControlTreeProvider(_ provider: any AccessibilityTreeProvider) async {
+        if let provider = provider as? IOSAccessibilityProvider {
+            await provider.stop()
+        }
     }
 
     private func sendTap(to connection: AnyDeviceConnectionBox, x: Double, y: Double) async throws {
