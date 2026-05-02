@@ -143,6 +143,8 @@ enum LocalControlMCPHandler {
             return try await textResult(store.localControlListIOSSchemes(decode(LocalControlIOSSchemesRequest.self, from: arguments)))
         case "kittyfarm_select_ios_project":
             return try await textResult(store.localControlSelectIOSProject(decode(LocalControlSelectIOSProjectRequest.self, from: arguments)))
+        case "kittyfarm_select_android_project":
+            return try await textResult(store.localControlSelectAndroidProject(decode(LocalControlSelectAndroidProjectRequest.self, from: arguments)))
         case "kittyfarm_build_and_run":
             return try await textResult(store.localControlBuildAndRun(decode(LocalControlBuildRunRequest.self, from: arguments)))
         case "kittyfarm_get_logs":
@@ -269,6 +271,7 @@ enum LocalControlMCPHandler {
         tool("kittyfarm_discover_project", "Discover Project", "Discover iOS and/or Android project settings from a path.", discoverSchema()),
         tool("kittyfarm_list_ios_schemes", "List iOS Schemes", "List schemes from an Xcode project/workspace path or the currently selected iOS project.", iosSchemesSchema()),
         tool("kittyfarm_select_ios_project", "Select iOS Project", "Select and persist the iOS project and optional scheme used by Build & Play.", selectIOSProjectSchema()),
+        tool("kittyfarm_select_android_project", "Select Android Project", "Select and persist the Android project, application id, and Gradle task used by Build & Play.", selectAndroidProjectSchema()),
         tool("kittyfarm_build_and_run", "Build And Run", "Build and launch selected projects on active devices, optionally selecting iOS scheme first.", buildRunSchema()),
         tool("kittyfarm_get_logs", "Get Logs", "Return recent KittyFarm build/runtime logs.", logsSchema()),
         tool("kittyfarm_read_logs", "Read Logs", "Read bounded, filtered KittyFarm logs with truncation metadata for MCP diagnostics.", readLogsSchema()),
@@ -390,6 +393,8 @@ enum LocalControlMCPHandler {
                 "iosProjectPath": string("Optional iOS project directory path."),
                 "iosScheme": string("Optional iOS Xcode scheme. When provided, it is selected and persisted before building."),
                 "androidProjectPath": string("Optional Android project directory path."),
+                "androidApplicationID": string("Optional Android application id to launch after install, including build-type suffixes such as .debug."),
+                "gradleTask": string("Optional Gradle install task, such as :hashi:installDebug."),
                 "deviceIds": [
                     "type": "array",
                     "items": string("KittyFarm deviceId from kittyfarm_list_devices."),
@@ -411,6 +416,16 @@ enum LocalControlMCPHandler {
             properties: [
                 "path": string("Optional .xcodeproj, .xcworkspace, or containing folder. Omit to change the selected project's scheme."),
                 "scheme": string("Optional Xcode scheme to persist for future Build & Play runs."),
+            ]
+        )
+    }
+
+    private static func selectAndroidProjectSchema() -> [String: Any] {
+        schema(
+            properties: [
+                "path": string("Optional Android project directory, gradlew, or file inside the project. Omit to update the selected Android project."),
+                "applicationID": string("Optional Android application id to launch after install, including build-type suffixes such as .debug."),
+                "gradleTask": string("Optional Gradle install task, such as :app:installDebug."),
             ]
         )
     }

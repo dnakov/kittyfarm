@@ -46,10 +46,50 @@ struct IOSProjectConfiguration: Codable, Equatable, Sendable {
     }
 }
 
+struct AndroidAppTarget: Codable, Equatable, Sendable, Identifiable {
+    var moduleName: String
+    var applicationID: String
+    var gradleTask: String
+
+    var id: String { gradleTask }
+
+    var displayName: String {
+        moduleName.isEmpty ? gradleTask : moduleName
+    }
+}
+
 struct AndroidProjectConfiguration: Codable, Equatable, Sendable {
     var projectDirectoryPath: String
     var applicationID: String
     var gradleTask: String = "installDebug"
+    var appTargets: [AndroidAppTarget] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case projectDirectoryPath
+        case applicationID
+        case gradleTask
+        case appTargets
+    }
+
+    init(
+        projectDirectoryPath: String,
+        applicationID: String,
+        gradleTask: String = "installDebug",
+        appTargets: [AndroidAppTarget] = []
+    ) {
+        self.projectDirectoryPath = projectDirectoryPath
+        self.applicationID = applicationID
+        self.gradleTask = gradleTask
+        self.appTargets = appTargets
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectDirectoryPath = try container.decode(String.self, forKey: .projectDirectoryPath)
+        applicationID = try container.decode(String.self, forKey: .applicationID)
+        gradleTask = try container.decodeIfPresent(String.self, forKey: .gradleTask) ?? "installDebug"
+        appTargets = try container.decodeIfPresent([AndroidAppTarget].self, forKey: .appTargets) ?? []
+    }
 
     var projectDirectoryURL: URL {
         URL(fileURLWithPath: projectDirectoryPath)

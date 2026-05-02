@@ -69,11 +69,8 @@ final class AndroidEmulatorConnection: DeviceConnection {
             ? nameOrBundleID
             : try await resolveAndroidPackage(name: nameOrBundleID, serial: serial)
 
-        _ = try await runAdb([
-            "-s", serial,
-            "shell", "monkey", "-p", packageName,
-            "-c", "android.intent.category.LAUNCHER", "1"
-        ])
+        let activity = try await resolveLauncherActivity(packageName: packageName, serial: serial)
+        _ = try await runAdb(["-s", serial, "shell", "am", "start", "-n", activity])
     }
 
     private func resolveAndroidPackage(name: String, serial: String) async throws -> String {
@@ -97,6 +94,22 @@ final class AndroidEmulatorConnection: DeviceConnection {
         }
 
         throw AndroidLaunchError.appNotFound(name)
+    }
+
+    private func resolveLauncherActivity(packageName: String, serial: String) async throws -> String {
+        let stdout = try await runAdb([
+            "-s", serial,
+            "shell", "cmd", "package", "resolve-activity", "--brief", packageName
+        ])
+
+        if let activity = stdout
+            .split(separator: "\n")
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .last(where: { $0.contains("/") && !$0.contains("No activity") }) {
+            return activity
+        }
+
+        throw AndroidLaunchError.launcherActivityNotFound(packageName)
     }
 
     // MARK: - ADB helpers
@@ -132,10 +145,12 @@ private enum AndroidEmulatorError: LocalizedError {
 
 enum AndroidLaunchError: LocalizedError {
     case appNotFound(String)
+    case launcherActivityNotFound(String)
 
     var errorDescription: String? {
         switch self {
         case .appNotFound(let name): return "No installed Android package matching \"\(name)\"."
+        case .launcherActivityNotFound(let packageName): return "No launcher activity found for Android package \"\(packageName)\"."
         }
     }
 }

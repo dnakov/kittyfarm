@@ -212,6 +212,27 @@ final class KittyFarmStore {
         if let data = defaults.data(forKey: Self.savedAndroidProjectKey),
            let project = try? JSONDecoder().decode(AndroidProjectConfiguration.self, from: data) {
             selectedAndroidProject = project
+
+            // Refresh app targets so saved multi-module Android configs track the current Gradle files.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if var updated = try? await BuildPlayRunner.discoverAndroidProject(at: project.projectDirectoryURL) {
+                    let savedTarget = project.appTargets.first { $0.gradleTask == project.gradleTask }
+                    if let target = updated.appTargets.first(where: { $0.gradleTask == project.gradleTask }) {
+                        updated.applicationID = if savedTarget == nil || savedTarget?.applicationID == project.applicationID {
+                            target.applicationID
+                        } else {
+                            project.applicationID
+                        }
+                        updated.gradleTask = target.gradleTask
+                    } else {
+                        updated.applicationID = project.applicationID
+                        updated.gradleTask = project.gradleTask
+                    }
+                    self.selectedAndroidProject = updated
+                    self.persistSelectedProjects()
+                }
+            }
         }
 
     }
@@ -315,6 +336,15 @@ final class KittyFarmStore {
     func updateAndroidGradleTask(_ task: String) {
         guard var project = selectedAndroidProject else { return }
         project.gradleTask = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        selectedAndroidProject = project
+        persistSelectedProjects()
+    }
+
+    func selectAndroidAppTarget(gradleTask: String) {
+        guard var project = selectedAndroidProject,
+              let target = project.appTargets.first(where: { $0.gradleTask == gradleTask }) else { return }
+        project.applicationID = target.applicationID
+        project.gradleTask = target.gradleTask
         selectedAndroidProject = project
         persistSelectedProjects()
     }

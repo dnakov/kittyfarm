@@ -8,6 +8,20 @@ struct BuildPlayRunner {
         let runtimeTargets: [RuntimeLogTarget]
     }
 
+    private struct AndroidDiscovery {
+        let applicationID: String
+        let gradleTask: String
+        let moduleName: String
+
+        var appTarget: AndroidAppTarget {
+            AndroidAppTarget(
+                moduleName: moduleName,
+                applicationID: applicationID,
+                gradleTask: gradleTask
+            )
+        }
+    }
+
     private static var fileManager: FileManager { FileManager.default }
     private static let xcodebuildURL = URL(fileURLWithPath: "/usr/bin/xcodebuild")
     private static var xcrunURL: URL { XcrunUtils.xcrunURL }
@@ -58,10 +72,15 @@ struct BuildPlayRunner {
 
     static func discoverAndroidProject(at url: URL) async throws -> AndroidProjectConfiguration {
         let projectDirectoryURL = try resolveAndroidProjectDirectory(from: url)
-        let applicationID = try detectAndroidApplicationID(in: projectDirectoryURL)
+        let discoveries = try detectAndroidProjects(in: projectDirectoryURL)
+        guard let discovery = preferredAndroidDiscovery(from: discoveries) else {
+            throw BuildPlayError.missingAndroidApplicationID(projectDirectoryURL.path)
+        }
         return AndroidProjectConfiguration(
             projectDirectoryPath: projectDirectoryURL.path,
-            applicationID: applicationID
+            applicationID: discovery.applicationID,
+            gradleTask: discovery.gradleTask,
+            appTargets: discoveries.map(\.appTarget)
         )
     }
 
@@ -188,9 +207,9 @@ struct BuildPlayRunner {
                     let devicePrefix = "[device \(avdName) (\(serial))]"
                     await logger?(.system, "\(devicePrefix) Waiting for emulator to finish booting")
                     try await waitForAndroidBoot(serial: serial, logPrefix: devicePrefix, logger: logger)
-                    try await runADB(
-                        ["-s", serial, "shell", "monkey", "-p", project.applicationID, "-c", "android.intent.category.LAUNCHER", "1"],
-                        context: "adb launch \(project.applicationID)",
+                    try await launchAndroidApp(
+                        applicationID: project.applicationID,
+                        serial: serial,
                         logPrefix: devicePrefix,
                         logger: logger
                     )
@@ -305,7 +324,7 @@ struct BuildPlayRunner {
         throw BuildPlayError.unsupportedAndroidSelection(resolvedURL.path)
     }
 
-    private static func detectAndroidApplicationID(in projectDirectoryURL: URL) throws -> String {
+    private static func detectAndroidProjects(in projectDirectoryURL: URL) throws -> [AndroidDiscovery] {
         let candidates = [
             projectDirectoryURL.appending(path: "app/build.gradle.kts"),
             projectDirectoryURL.appending(path: "app/build.gradle"),
@@ -313,10 +332,12 @@ struct BuildPlayRunner {
             projectDirectoryURL.appending(path: "build.gradle")
         ]
 
+        var discoveries: [AndroidDiscovery] = []
+        var seenBuildFiles: Set<String> = []
         for candidate in candidates where fileManager.fileExists(atPath: candidate.path) {
-            let contents = try String(contentsOf: candidate, encoding: .utf8)
-            if let applicationID = matchFirst(in: contents, pattern: #"applicationId\s*=\s*"([^"]+)""#) {
-                return applicationID
+            if let discovery = try detectAndroidProject(in: candidate, projectDirectoryURL: projectDirectoryURL) {
+                discoveries.append(discovery)
+                seenBuildFiles.insert(candidate.standardizedFileURL.path)
             }
         }
 
@@ -326,14 +347,78 @@ struct BuildPlayRunner {
             maxDepth: 4
         )
 
-        for candidate in buildFiles {
-            let contents = try String(contentsOf: candidate, encoding: .utf8)
-            if let applicationID = matchFirst(in: contents, pattern: #"applicationId\s*=\s*"([^"]+)""#) {
-                return applicationID
+        for candidate in buildFiles where !seenBuildFiles.contains(candidate.standardizedFileURL.path) {
+            if let discovery = try detectAndroidProject(in: candidate, projectDirectoryURL: projectDirectoryURL) {
+                discoveries.append(discovery)
             }
         }
 
-        throw BuildPlayError.missingAndroidApplicationID(projectDirectoryURL.path)
+        let uniqueDiscoveries = Dictionary(grouping: discoveries, by: \.gradleTask)
+            .compactMap { _, values in values.first }
+        return uniqueDiscoveries.sorted { $0.gradleTask < $1.gradleTask }
+    }
+
+    private static func preferredAndroidDiscovery(from discoveries: [AndroidDiscovery]) -> AndroidDiscovery? {
+        discoveries.first { $0.gradleTask == ":app:installDebug" }
+            ?? discoveries.first { $0.gradleTask == "installDebug" }
+            ?? discoveries.first
+    }
+
+    private static func detectAndroidProject(
+        in buildFileURL: URL,
+        projectDirectoryURL: URL
+    ) throws -> AndroidDiscovery? {
+        let contents = try String(contentsOf: buildFileURL, encoding: .utf8)
+        guard var applicationID = matchFirst(
+            in: contents,
+            pattern: #"applicationId\s*(?:=|\s)\s*["']([^"']+)["']"#
+        ) else {
+            return nil
+        }
+
+        let applicationIDSuffixPattern = #"applicationIdSuffix\s*(?:=|\s)\s*["']([^"']+)["']"#
+        let debugSuffix = block(named: "debug", in: contents)
+            .flatMap { matchFirst(in: $0, pattern: applicationIDSuffixPattern) }
+            ?? matchFirst(in: contents, pattern: applicationIDSuffixPattern)
+
+        if let debugSuffix {
+            applicationID += debugSuffix
+        }
+
+        return AndroidDiscovery(
+            applicationID: applicationID,
+            gradleTask: androidInstallTask(for: buildFileURL, projectDirectoryURL: projectDirectoryURL),
+            moduleName: androidModuleName(for: buildFileURL, projectDirectoryURL: projectDirectoryURL)
+        )
+    }
+
+    private static func androidInstallTask(for buildFileURL: URL, projectDirectoryURL: URL) -> String {
+        let moduleURL = buildFileURL.deletingLastPathComponent().standardizedFileURL
+        let rootURL = projectDirectoryURL.standardizedFileURL
+        guard moduleURL.path != rootURL.path else {
+            return "installDebug"
+        }
+
+        let relativePath = moduleURL.path
+            .replacingOccurrences(of: rootURL.path, with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let modulePath = relativePath
+            .split(separator: "/")
+            .joined(separator: ":")
+
+        return modulePath.isEmpty ? "installDebug" : ":\(modulePath):installDebug"
+    }
+
+    private static func androidModuleName(for buildFileURL: URL, projectDirectoryURL: URL) -> String {
+        let moduleURL = buildFileURL.deletingLastPathComponent().standardizedFileURL
+        let rootURL = projectDirectoryURL.standardizedFileURL
+        guard moduleURL.path != rootURL.path else {
+            return projectDirectoryURL.lastPathComponent
+        }
+
+        return moduleURL.path
+            .replacingOccurrences(of: rootURL.path, with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     private static func findBuiltIOSApp(in derivedDataURL: URL, preferredName: String) throws -> URL {
@@ -440,6 +525,33 @@ struct BuildPlayRunner {
         }
 
         throw BuildPlayError.androidBootTimeout(serial)
+    }
+
+    private static func launchAndroidApp(
+        applicationID: String,
+        serial: String,
+        logPrefix: String? = nil,
+        logger: Logger?
+    ) async throws {
+        let resolveResult = try await runLoggedCommand(.init(
+            executableURL: adbBinaryURL(),
+            arguments: ["-s", serial, "shell", "cmd", "package", "resolve-activity", "--brief", applicationID]
+        ), context: "adb resolve launcher \(applicationID)", logPrefix: logPrefix, logger: logger)
+        try resolveResult.requireSuccess("adb resolve launcher \(applicationID)")
+
+        guard let activity = resolveResult.stdout
+            .split(separator: "\n")
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .last(where: { $0.contains("/") && !$0.contains("No activity") }) else {
+            throw BuildPlayError.androidLauncherActivityNotFound(applicationID)
+        }
+
+        try await runADB(
+            ["-s", serial, "shell", "am", "start", "-n", activity],
+            context: "adb launch \(applicationID)",
+            logPrefix: logPrefix,
+            logger: logger
+        )
     }
 
     private static func runSimctl(
@@ -633,6 +745,36 @@ struct BuildPlayRunner {
         return String(contents[valueRange])
     }
 
+    private static func block(named name: String, in contents: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"\b\#(name)\b\s*\{"#) else {
+            return nil
+        }
+        let range = NSRange(contents.startIndex..., in: contents)
+        guard let match = regex.firstMatch(in: contents, range: range),
+              let matchRange = Range(match.range, in: contents),
+              let openingBrace = contents[matchRange].lastIndex(of: "{") else {
+            return nil
+        }
+
+        var depth = 1
+        var index = contents.index(after: openingBrace)
+        while index < contents.endIndex {
+            switch contents[index] {
+            case "{":
+                depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    return String(contents[contents.index(after: openingBrace)..<index])
+                }
+            default:
+                break
+            }
+            index = contents.index(after: index)
+        }
+        return nil
+    }
+
     private static func sanitizedComponent(_ value: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
         return value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" }.map(String.init).joined()
@@ -670,6 +812,7 @@ enum BuildPlayError: LocalizedError {
     case missingJavaRuntime
     case androidSerialLookupFailed(String)
     case androidBootTimeout(String)
+    case androidLauncherActivityNotFound(String)
 
     var errorDescription: String? {
         switch self {
@@ -691,6 +834,8 @@ enum BuildPlayError: LocalizedError {
             return "Couldn't match running Android emulators for: \(names)."
         case let .androidBootTimeout(serial):
             return "Timed out waiting for Android emulator \(serial) to finish booting."
+        case let .androidLauncherActivityNotFound(applicationID):
+            return "No launcher activity was found for Android app \(applicationID)."
         }
     }
 }

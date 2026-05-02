@@ -266,10 +266,18 @@ struct LocalControlSelectIOSProjectRequest: Codable, Sendable {
     let scheme: String?
 }
 
+struct LocalControlSelectAndroidProjectRequest: Codable, Sendable {
+    let path: String?
+    let applicationID: String?
+    let gradleTask: String?
+}
+
 struct LocalControlBuildRunRequest: Codable, Sendable {
     let iosProjectPath: String?
     let iosScheme: String?
     let androidProjectPath: String?
+    let androidApplicationID: String?
+    let gradleTask: String?
     let deviceIds: [String]?
 }
 
