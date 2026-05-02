@@ -64,6 +64,24 @@ struct ProjectPickerSheet: View {
                             .textSelection(.enabled)
                     }
 
+                    if let project = store.selectedAndroidProject, !project.appTargets.isEmpty {
+                        Picker(
+                            "App",
+                            selection: Binding(
+                                get: { store.selectedAndroidProject?.gradleTask ?? project.gradleTask },
+                                set: { task in
+                                    store.selectAndroidAppTarget(gradleTask: task)
+                                }
+                            )
+                        ) {
+                            ForEach(project.appTargets) { target in
+                                Text(target.displayName)
+                                    .tag(target.gradleTask)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
                     TextField(
                         "Application ID",
                         text: Binding(

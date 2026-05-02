@@ -243,6 +243,34 @@ extension KittyFarmStore {
         return selectedIOSProject
     }
 
+    func localControlSelectAndroidProject(_ request: LocalControlSelectAndroidProjectRequest) async throws -> AndroidProjectConfiguration {
+        var project: AndroidProjectConfiguration
+        if let path = request.path?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            project = try await BuildPlayRunner.discoverAndroidProject(at: URL(fileURLWithPath: path))
+        } else if let selectedAndroidProject {
+            project = selectedAndroidProject
+        } else {
+            throw LocalControlStoreError.invalidRequest("Select Android project requires path when no Android project is selected.")
+        }
+
+        if let applicationID = request.applicationID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            project.applicationID = applicationID
+        }
+        if let gradleTask = request.gradleTask?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            if let target = project.appTargets.first(where: { $0.gradleTask == gradleTask }) {
+                project.applicationID = request.applicationID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? target.applicationID
+                project.gradleTask = target.gradleTask
+            } else {
+                project.gradleTask = gradleTask
+            }
+        }
+
+        selectedAndroidProject = project
+        persistSelectedProjects()
+        statusMessage = "Selected Android project \(project.displayName)."
+        return project
+    }
+
     func localControlBuildAndRun(_ request: LocalControlBuildRunRequest) async throws -> LocalControlOKResponse {
         if let path = request.iosProjectPath {
             let url = URL(fileURLWithPath: path)
@@ -258,8 +286,21 @@ extension KittyFarmStore {
             await selectIOSScheme(scheme)
         }
         if let path = request.androidProjectPath {
-            selectedAndroidProject = try await BuildPlayRunner.discoverAndroidProject(at: URL(fileURLWithPath: path))
+            var project = try await BuildPlayRunner.discoverAndroidProject(at: URL(fileURLWithPath: path))
+            applyAndroidBuildRunOverrides(
+                applicationID: request.androidApplicationID,
+                gradleTask: request.gradleTask,
+                to: &project
+            )
+            selectedAndroidProject = project
             persistSelectedProjects()
+        } else if request.androidApplicationID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty != nil
+            || request.gradleTask?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty != nil {
+            _ = try await localControlSelectAndroidProject(.init(
+                path: nil,
+                applicationID: request.androidApplicationID,
+                gradleTask: request.gradleTask
+            ))
         }
 
         if let ids = request.deviceIds, !ids.isEmpty {
@@ -276,6 +317,24 @@ extension KittyFarmStore {
         }
 
         return LocalControlOKResponse(ok: true, message: statusMessage)
+    }
+
+    private func applyAndroidBuildRunOverrides(
+        applicationID: String?,
+        gradleTask: String?,
+        to project: inout AndroidProjectConfiguration
+    ) {
+        if let applicationID = applicationID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            project.applicationID = applicationID
+        }
+        if let gradleTask = gradleTask?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            if let target = project.appTargets.first(where: { $0.gradleTask == gradleTask }) {
+                project.applicationID = applicationID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? target.applicationID
+                project.gradleTask = target.gradleTask
+            } else {
+                project.gradleTask = gradleTask
+            }
+        }
     }
 
     func localControlLogs(limit: Int) -> LocalControlLogsResponse {
